@@ -1,3 +1,3 @@
 from .config import KarmmaConfig
 from .karmma import KarmmaSampler
-from .structs import XlmParams, ThetaParams, KarmmaPosition, NUTSInfo
+from .structs import KarmmaPosition, NUTSInfo, ThetaParams, XlmParams

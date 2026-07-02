@@ -21,19 +21,21 @@ Two-layer structure so that jacfwd can differentiate through the gradient trace:
 jax.hessian works; jacrev(jacrev) does not (transposing a pure_callback
 is unsupported by JAX).
 """
+
 import jax
+
 jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
-import healpy as hp
-import numpy as np
-import astropy.io.fits as fits
-from functools import partial, lru_cache
 import time
 import urllib.request
+from functools import lru_cache, partial
 from pathlib import Path
 
-import ducc0.sht
+import astropy.io.fits as fits
 import ducc0.healpix
+import ducc0.sht
+import healpy as hp
+import jax.numpy as jnp
+import numpy as np
 
 
 @lru_cache(maxsize=1)
@@ -46,9 +48,9 @@ def get_pixel_weights(nside: int) -> np.ndarray:
     """
     nside = int(nside)
     nside_str = f"{nside:04d}"
-    filename  = f"healpix_full_weights_nside_{nside_str}.fits"
+    filename = f"healpix_full_weights_nside_{nside_str}.fits"
     cache_dir = Path.home() / ".cache" / "karmma" / "full_weights"
-    path      = cache_dir / filename
+    path = cache_dir / filename
 
     if not path.exists():
         url = (
@@ -63,7 +65,7 @@ def get_pixel_weights(nside: int) -> np.ndarray:
                 break
             except Exception as e:
                 if attempt < 2:
-                    print(f"  Attempt {attempt+1} failed ({e}), retrying...")
+                    print(f"  Attempt {attempt + 1} failed ({e}), retrying...")
                     time.sleep(2)
                 else:
                     path.unlink(missing_ok=True)
@@ -89,7 +91,7 @@ def get_pixel_weights(nside: int) -> np.ndarray:
 
         if ring < 2 * nside - 1:
             psouth = npix - pnorth - qp4
-            w8map[psouth:psouth + qp4] = w8map[pnorth:pnorth + qp4]
+            w8map[psouth : psouth + qp4] = w8map[pnorth : pnorth + qp4]
 
         pnorth += qp4
         vpix += (qpix + 1) // 2 + 1 - ((qpix % 2) | shifted)
@@ -112,8 +114,8 @@ def get_ms(lmax):
 @lru_cache(maxsize=4)
 def _healpix_geo(nside: int) -> dict:
     """HEALPix ring geometry for ducc0, cached per nside. Unpack with **geo."""
-    geo = ducc0.healpix.Healpix_Base(nside, 'RING').sht_info()
-    return {k: geo[k] for k in ('theta', 'phi0', 'nphi', 'ringstart')}
+    geo = ducc0.healpix.Healpix_Base(nside, "RING").sht_info()
+    return {k: geo[k] for k in ("theta", "phi0", "nphi", "ringstart")}
 
 
 # ── inner layer: bare linear callbacks, forward-mode capable ──────────────────
@@ -124,27 +126,36 @@ def _healpix_geo(nside: int) -> dict:
 # Reverse-mode flow never reaches these primitives — it is fully handled by the
 # custom_vjp wrappers below.
 
+
 @partial(jax.custom_jvp, nondiff_argnums=(1, 2, 3))
 def _synthesis(alms, nside, lmax, spin):
     """Bare synthesis SHT: (Nbins, ncomp, n_alm) complex → (Nbins, ncomp, n_pix) real."""
     Nbins, ncomp = alms.shape[0], alms.shape[1]
     n_pix = hp.nside2npix(nside)
-    geo   = _healpix_geo(nside)
+    geo = _healpix_geo(nside)
+
     def _cb(a):
         return ducc0.sht.synthesis(
             alm=np.asarray(a, dtype=np.complex128),
-            **geo, lmax=lmax, mmax=lmax, spin=spin, nthreads=0,
+            **geo,
+            lmax=lmax,
+            mmax=lmax,
+            spin=spin,
+            nthreads=0,
         )
+
     return jax.pure_callback(
-        _cb, jax.ShapeDtypeStruct((Nbins, ncomp, n_pix), jnp.float64),
-        alms, vmap_method='sequential',
+        _cb,
+        jax.ShapeDtypeStruct((Nbins, ncomp, n_pix), jnp.float64),
+        alms,
+        vmap_method="sequential",
     )
+
 
 @_synthesis.defjvp
 def _synthesis_jvp(nside, lmax, spin, primals, tangents):
     (alms,), (dalms,) = primals, tangents
-    return (_synthesis(alms, nside, lmax, spin),
-            _synthesis(dalms, nside, lmax, spin))
+    return (_synthesis(alms, nside, lmax, spin), _synthesis(dalms, nside, lmax, spin))
 
 
 @partial(jax.custom_jvp, nondiff_argnums=(1, 2, 3))
@@ -156,22 +167,33 @@ def _adjoint_synthesis(maps, nside, lmax, spin):
     """
     Nbins, ncomp = maps.shape[0], maps.shape[1]
     n_alm = hp.Alm.getsize(lmax)
-    geo   = _healpix_geo(nside)
+    geo = _healpix_geo(nside)
+
     def _cb(g):
         return ducc0.sht.adjoint_synthesis(
             map=np.asarray(g, dtype=np.float64),
-            **geo, lmax=lmax, mmax=lmax, spin=spin, nthreads=0,
+            **geo,
+            lmax=lmax,
+            mmax=lmax,
+            spin=spin,
+            nthreads=0,
         )
+
     return jax.pure_callback(
-        _cb, jax.ShapeDtypeStruct((Nbins, ncomp, n_alm), jnp.complex128),
-        maps, vmap_method='sequential',
+        _cb,
+        jax.ShapeDtypeStruct((Nbins, ncomp, n_alm), jnp.complex128),
+        maps,
+        vmap_method="sequential",
     )
+
 
 @_adjoint_synthesis.defjvp
 def _adjoint_synthesis_jvp(nside, lmax, spin, primals, tangents):
     (maps,), (dmaps,) = primals, tangents
-    return (_adjoint_synthesis(maps, nside, lmax, spin),
-            _adjoint_synthesis(dmaps, nside, lmax, spin))
+    return (
+        _adjoint_synthesis(maps, nside, lmax, spin),
+        _adjoint_synthesis(dmaps, nside, lmax, spin),
+    )
 
 
 # ── outer layer: validated adjoints via custom_vjp ────────────────────────────
@@ -179,21 +201,25 @@ def _adjoint_synthesis_jvp(nside, lmax, spin, primals, tangents):
 # _fwd functions call the inner custom_jvp primitives (not the outer custom_vjp
 # functions), so that jacfwd can apply JVP through them.
 
+
 @partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3))
 def _alm2map(alms, nside, lmax, spin):
     """Synthesis SHT: (Nbins, ncomp, n_alm) → (Nbins, ncomp, n_pix)."""
     return _synthesis(alms, nside, lmax, spin)
 
+
 def _alm2map_fwd(alms, nside, lmax, spin):
     return _synthesis(alms, nside, lmax, spin), ()
+
 
 def _alm2map_bwd(nside, lmax, spin, _, g_maps):
     # VJP of synthesis: adjoint_synthesis(g_maps), then double m>0 modes to
     # account for conjugate-symmetry (each m>0 coefficient appears once in
     # the stored alm but contributes to both +m and -m in the full sum).
-    ms    = get_ms(lmax)
+    ms = get_ms(lmax)
     g_alm = _adjoint_synthesis(g_maps, nside, lmax, spin)
     return (jnp.conj(jnp.where(ms == 0, g_alm, 2.0 * g_alm)),)
+
 
 _alm2map.defvjp(_alm2map_fwd, _alm2map_bwd)
 
@@ -208,31 +234,35 @@ def _map2alm(maps, lmax, spin):
     """
     n_pix = maps.shape[-1]
     nside = hp.npix2nside(n_pix)
-    w     = get_pixel_weights(nside)
+    w = get_pixel_weights(nside)
     return _adjoint_synthesis(w * maps, nside, lmax, spin) * (4.0 * jnp.pi / n_pix)
 
+
 def _map2alm_fwd(maps, lmax, spin):
-    n_pix  = maps.shape[-1]
-    nside  = hp.npix2nside(n_pix)
-    w      = get_pixel_weights(nside)
+    n_pix = maps.shape[-1]
+    nside = hp.npix2nside(n_pix)
+    w = get_pixel_weights(nside)
     result = _adjoint_synthesis(w * maps, nside, lmax, spin) * (4.0 * jnp.pi / n_pix)
     return result, (n_pix,)
+
 
 def _map2alm_bwd(lmax, spin, res, g_alm):
     # VJP of (4π/n_pix) · adjoint_synthesis(w · maps):
     # result is w · synthesis(g_alm') · (4π/n_pix), where g_alm' halves m>0
     # modes (inverse of the 2x doubling in _alm2map_bwd).
-    n_pix, = res
-    nside  = hp.npix2nside(n_pix)
-    w      = get_pixel_weights(nside)
-    ms     = get_ms(lmax)
+    (n_pix,) = res
+    nside = hp.npix2nside(n_pix)
+    w = get_pixel_weights(nside)
+    ms = get_ms(lmax)
     g_scaled = jnp.where(ms == 0, jnp.conj(g_alm), 0.5 * jnp.conj(g_alm))
     return (w * _synthesis(g_scaled, nside, lmax, spin) * (4.0 * jnp.pi / n_pix),)
+
 
 _map2alm.defvjp(_map2alm_fwd, _map2alm_bwd)
 
 
 # ── public API ────────────────────────────────────────────────────────────────
+
 
 def alm2map(alms, nside, lmax, spin=0):
     """Synthesis SHT for all bins via ducc0.
