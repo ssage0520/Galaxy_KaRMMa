@@ -131,7 +131,7 @@ class KarmmaConfig:
 
         seed = cfg.get("seed")
         if seed is None:
-            seed = int(np.random.randint(0, 2**31))
+            seed = int(np.random.default_rng().integers(0, 2**31))
             print(f"No seed provided — using randomly generated seed: {seed}")
         else:
             seed = int(seed)
