@@ -1,0 +1,21 @@
+analysis:
+    nbins: 2
+    nside: 256
+    alpha: 0.49821807, 0.39848170
+    beta: 0.52686442, 0.58211452
+    cl_file: /spiff/ssage/karmma_data/LN_dg_RS_linmu/Inputs/cl_sim42.npy
+    pixwin: /spiff/ssage/karmma_data/LN_dg_RS_linmu/Inputs/pixwin_256.npy
+
+io:
+    datafile: /spiff/ssage/karmma_data/LN_dg_RS_linmu/Inputs/mock_dg.h5
+    io_dir: /spiff/ssage/karmma_data/LN_dg_RS_linmu/
+    init_file: null
+    theta_file: /spiff/ssage/karmma_data/LN_dg_RS_linmu/Inputs/theta_true.h5
+
+mcmc:
+    infer_theta: true
+    seed: null
+    n_warmup: 400
+    n_samples: 400
+    init_step_size: 0.0001
+    target_acceptance_rate: null
