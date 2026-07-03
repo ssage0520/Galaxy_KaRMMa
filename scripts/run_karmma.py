@@ -7,6 +7,7 @@ import numpy as np
 jax.config.update("jax_enable_x64", True)
 import h5py as h5
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from karmma import KarmmaConfig, KarmmaSampler
 from karmma.structs import KarmmaPosition, ThetaParams, XlmParams
 
