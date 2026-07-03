@@ -1,10 +1,12 @@
 import argparse
 import os
+import sys
 
 import h5py as h5
 import numpy as np
 from tqdm import trange
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from karmma import KarmmaConfig
 from karmma.utils import (
     get_1ptfunc,
