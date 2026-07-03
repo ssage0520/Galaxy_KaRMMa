@@ -10,6 +10,11 @@ import h5py as h5
 from karmma import KarmmaConfig, KarmmaSampler
 from karmma.structs import KarmmaPosition, ThetaParams, XlmParams
 
+# Bayesian pseudo-count controlling how much the initial_imm seed persists
+# across warmup windows in blackjax's window_adaptation (requires the
+# jax_karmma_dev blackjax build). See KarmmaSampler.sample.
+IMM_SHRINKAGE_TO_PREVIOUS = 20.0
+
 configfile = sys.argv[1]
 config = KarmmaConfig(configfile)
 
@@ -42,6 +47,9 @@ if io.initial_position.xlm is None:
 else:
     initial_position = io.initial_position
 
+print("Computing initial IMM (Schur+CG diagonal estimate) at the initial position ...")
+initial_imm = sampler.initialize_imm(initial_position)
+
 states, infos, mcmc_parameters, winfo = sampler.sample(
     key=mcmc.key,
     num_warmup=mcmc.n_warmup,
@@ -49,6 +57,8 @@ states, infos, mcmc_parameters, winfo = sampler.sample(
     step_size=mcmc.step_size,
     target_acceptance_rate=mcmc.target_acceptance,
     initial_position=initial_position,
+    initial_imm=initial_imm,
+    imm_shrinkage_to_previous=IMM_SHRINKAGE_TO_PREVIOUS,
 )
 
 
@@ -80,6 +90,10 @@ with h5.File(os.path.join(io.io_dir, "mcmc_metadata.h5"), "w") as f:
     f["warmup_is_divergent"] = np.array(winfo.info.is_divergent)
     f["warmup_num_integration_steps"] = np.array(winfo.info.num_integration_steps)
     f["inverse_mass_matrix"] = np.array(mcmc_parameters["inverse_mass_matrix"])
+
+    # initial IMM provenance
+    f["initial_imm"] = np.array(initial_imm)
+    f["imm_shrinkage_to_previous"] = np.array(IMM_SHRINKAGE_TO_PREVIOUS)
 
     f["log_prob"] = np.array(infos.logdensity)
 

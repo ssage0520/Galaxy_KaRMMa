@@ -4,12 +4,14 @@ from datetime import timedelta
 import blackjax
 import healpy as hp
 import jax
+import jax.flatten_util
 
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jax.scipy.stats as jst
 import numpy as np
 from blackjax.adaptation.base import get_filter_adapt_info_fn
+from jax.scipy.sparse.linalg import cg
 from scipy.special import legendre_p_all, roots_legendre
 
 from karmma.structs import KarmmaPosition, NUTSInfo, ThetaParams, XlmParams
@@ -224,15 +226,118 @@ class KarmmaSampler:
             + log_lik
         )
 
+    def initialize_imm(
+        self,
+        position: KarmmaPosition,
+        tol: float = 1e-3,
+        maxiter: int = 300,
+        kappa_max: float = 1e9,
+        verbose: bool = True,
+    ) -> np.ndarray:
+        """Diagonal IMM for NUTS warm-start via Schur complement + CG.
+
+        Marginalises over the xlm block with n_theta CG solves against H_xx,
+        fixes the resulting indefinite n_theta×n_theta Schur complement to PD
+        via |λ| eigenvalue correction, and assembles the full N_full-length
+        diagonal IMM expected by BlackJax.
+
+        xlm block  → 1.0  (consistent with the N(0,1) prior)
+        theta block → Schur+CG estimate with |λ| fix
+
+        Requires `infer_theta=True` (theta must be part of the sampled
+        position for the Schur complement over the theta block to apply).
+
+        Returns
+        -------
+        np.ndarray of shape (n_x + n_theta,) in BlackJax pytree-flat layout:
+            [xlm.real.ravel(), xlm.imag.ravel(), theta fields in ThetaParams order]
+        """
+        n_theta = len(ThetaParams._fields) * self.Nbins
+
+        # ravel_pytree matches BlackJax's pytree flattening: xlm-first, theta-last.
+        flat_pos, unravel_fn = jax.flatten_util.ravel_pytree(position)
+        N_full = flat_pos.shape[0]
+        n_x = N_full - n_theta
+
+        def _flat_log_prob(flat):
+            return self.log_prob(unravel_fn(flat))
+
+        @jax.jit
+        def _hvp(v):
+            _, g = jax.jvp(jax.grad(_flat_log_prob), (flat_pos,), (v,))
+            return -g
+
+        @jax.jit
+        def _hvp_xx(vx):
+            v_full = jnp.zeros(N_full).at[:n_x].set(vx)
+            return _hvp(v_full)[:n_x]
+
+        if verbose:
+            print(
+                f"initialize_imm: step 1 — {n_theta} b-indicator HVPs ...", flush=True
+            )
+        rows_b = jnp.stack(
+            [_hvp(jnp.zeros(N_full).at[n_x + i].set(1.0)) for i in range(n_theta)]
+        )
+        H_bb_est = rows_b[:, n_x:]
+        H_bx_est = rows_b[:, :n_x]
+
+        if verbose:
+            print(
+                f"initialize_imm: step 2 — {n_theta} CG solves "
+                f"(tol={tol}, maxiter={maxiter}) ...",
+                flush=True,
+            )
+        X = jnp.stack(
+            [
+                cg(_hvp_xx, H_bx_est[j], tol=tol, maxiter=maxiter)[0]
+                for j in range(n_theta)
+            ]
+        )
+
+        precision_bb = H_bb_est - H_bx_est @ X.T
+
+        if verbose:
+            evals = np.array(jnp.linalg.eigvalsh(precision_bb))
+            resid = np.array(
+                jax.vmap(
+                    lambda x, r: jnp.linalg.norm(_hvp_xx(x) - r) / jnp.linalg.norm(r)
+                )(X, H_bx_est)
+            )
+            print(f"  CG rel residuals: max={resid.max():.2e}  mean={resid.mean():.2e}")
+            print(
+                f"  Schur eigenvalues: min={evals.min():.4e}  max={evals.max():.4e}  "
+                f"negative={np.sum(evals < 0)}"
+            )
+
+        S = 0.5 * (precision_bb + precision_bb.T)
+        w, U = jnp.linalg.eigh(S)
+        w_fixed = jnp.clip(jnp.abs(w), a_min=float(jnp.max(jnp.abs(w))) / kappa_max)
+        imm_theta = np.array(jnp.diag((U / w_fixed) @ U.T))
+
+        return np.concatenate([np.ones(n_x), imm_theta])
+
     def sample(
         self,
         key,
         num_warmup,
         num_samples,
         initial_position: KarmmaPosition,
+        initial_imm: np.ndarray,
+        imm_shrinkage_to_previous: float = 0.0,
         step_size=0.05,
         target_acceptance_rate=0.65,
     ):
+        """Runs NUTS, seeding window_adaptation's inverse mass matrix.
+
+        Requires a blackjax build with `initial_inverse_mass_matrix` /
+        `imm_shrinkage_to_previous` support in `window_adaptation` (the
+        jax_karmma_dev environment) — stock blackjax (jax_karmma) raises a
+        TypeError.
+
+        `initial_imm` must be a 1-D diagonal IMM in BlackJax pytree-flat
+        layout, e.g. as returned by `initialize_imm`.
+        """
 
         log_prob = jax.jit(self.log_prob)
 
@@ -246,6 +351,8 @@ class KarmmaSampler:
             blackjax.nuts,
             logdensity_fn=log_prob,
             initial_step_size=step_size,
+            initial_inverse_mass_matrix=initial_imm,
+            imm_shrinkage_to_previous=imm_shrinkage_to_previous,
             target_acceptance_rate=target_acceptance_rate,
             is_mass_matrix_diagonal=True,
             progress_bar=True,
