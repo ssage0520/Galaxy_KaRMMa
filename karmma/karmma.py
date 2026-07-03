@@ -10,11 +10,11 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jax.scipy.stats as jst
 import numpy as np
-from blackjax.adaptation.base import get_filter_adapt_info_fn
+from blackjax.adaptation.mclmc_adaptation import MCLMCAdaptationState
 from jax.scipy.sparse.linalg import cg
 from scipy.special import legendre_p_all, roots_legendre
 
-from karmma.structs import KarmmaPosition, NUTSInfo, ThetaParams, XlmParams
+from karmma.structs import KarmmaPosition, MCLMCInfo, ThetaParams, XlmParams
 from karmma.transforms import alm2map, map2alm
 
 _INVGAMMA_ALPHA_R = 1.0  # TODO: expose in McmcConfig
@@ -234,7 +234,7 @@ class KarmmaSampler:
         kappa_max: float = 1e9,
         verbose: bool = True,
     ) -> np.ndarray:
-        """Diagonal IMM for NUTS warm-start via Schur complement + CG.
+        """Diagonal IMM warm-start via Schur complement + CG.
 
         Marginalises over the xlm block with n_theta CG solves against H_xx,
         fixes the resulting indefinite n_theta×n_theta Schur complement to PD
@@ -320,91 +320,131 @@ class KarmmaSampler:
     def sample(
         self,
         key,
-        num_warmup,
         num_samples,
         initial_position: KarmmaPosition,
         initial_imm: np.ndarray,
-        imm_shrinkage_to_previous: float = 0.0,
-        step_size=0.05,
-        target_acceptance_rate=0.65,
+        frac_tune1: float = 0.1,
+        frac_tune2: float = 0.3,
+        frac_tune3: float = 0.1,
+        l_factor: float = 0.4,
+        desired_energy_var: float = 5e-4,
+        thinning: int = 5,
     ):
-        """Runs NUTS, seeding window_adaptation's inverse mass matrix.
+        """Runs MCLMC, seeding its diagonal preconditioner from `initial_imm`.
 
-        Requires a blackjax build with `initial_inverse_mass_matrix` /
-        `imm_shrinkage_to_previous` support in `window_adaptation` (the
-        jax_karmma_dev environment) — stock blackjax (jax_karmma) raises a
-        TypeError.
+        Requires the jax_karmma_dev blackjax build — its `mclmc.build_kernel`
+        no longer bakes `logdensity_fn`/`inverse_mass_matrix` into the kernel
+        closure (they're call-time args instead), and `mclmc_find_L_and_step_size`
+        takes `logdensity_fn` explicitly and `l_factor` (not `Lfactor`).
 
         `initial_imm` must be a 1-D diagonal IMM in BlackJax pytree-flat
         layout, e.g. as returned by `initialize_imm`.
+
+        `num_samples` is the number of samples actually saved (post-thinning),
+        not a raw integrator-step budget. Warmup is sized as a fraction of
+        that same number — (frac_tune1 + frac_tune2 + frac_tune3) * num_samples
+        thinned calls — there is no separate warmup count, since MCLMC's own
+        tuning routine splits one `num_steps` budget into its three phases
+        internally. This mirrors dev_notebooks/mclmc.ipynb's validated
+        thin_kernel/thin_algorithm usage; don't re-derive the unit
+        conversions (e.g. `l_factor * thinning`) independently.
         """
 
         log_prob = jax.jit(self.log_prob)
+        dim = blackjax.util.pytree_size(initial_position)
 
         t0 = time.perf_counter()
 
-        filter_fn = get_filter_adapt_info_fn(
-            info_keys={"acceptance_rate", "is_divergent", "num_integration_steps"}
+        key, key_init, key_warmup, key_sample = jax.random.split(key, 4)
+
+        def rms_info(info):
+            return jax.tree.map(lambda x: (x**2).mean() ** 0.5, info)
+
+        # thin_kernel wraps the raw kernel(rng_key, state, logdensity_fn,
+        # inverse_mass_matrix, L, step_size) signature from build_kernel —
+        # needed for warmup because mclmc_find_L_and_step_size actively
+        # changes L/step_size/inverse_mass_matrix between calls as it tunes
+        # them, so it must inject the current guess at each call rather than
+        # working through a SamplingAlgorithm with those values baked in.
+        thinned_kernel = blackjax.util.thin_kernel(
+            blackjax.mcmc.mclmc.build_kernel(
+                integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
+                desired_energy_var=desired_energy_var,
+            ),
+            thinning=thinning,
+            info_transform=rms_info,
         )
 
-        warmup = blackjax.window_adaptation(
-            blackjax.nuts,
-            logdensity_fn=log_prob,
-            initial_step_size=step_size,
-            initial_inverse_mass_matrix=initial_imm,
-            imm_shrinkage_to_previous=imm_shrinkage_to_previous,
-            target_acceptance_rate=target_acceptance_rate,
-            is_mass_matrix_diagonal=True,
-            progress_bar=True,
-            adaptation_info_fn=filter_fn,
+        init_state = blackjax.mcmc.mclmc.init(
+            position=initial_position, logdensity_fn=log_prob, rng_key=key_init
         )
-        key, warmup_key = jax.random.split(key)
+        initial_params = MCLMCAdaptationState(
+            L=jnp.sqrt(dim),
+            step_size=jnp.sqrt(dim) * 0.25,
+            inverse_mass_matrix=initial_imm,
+        )
+
         print()
-        (wstate, parameters), winfo = warmup.run(
-            warmup_key, initial_position, num_steps=num_warmup
+        tuned_state, tuned_params, warmup_calls = blackjax.mclmc_find_L_and_step_size(
+            mclmc_kernel=thinned_kernel,
+            logdensity_fn=log_prob,
+            num_steps=num_samples,
+            state=init_state,
+            rng_key=key_warmup,
+            diagonal_preconditioning=True,
+            frac_tune1=frac_tune1,
+            frac_tune2=frac_tune2,
+            frac_tune3=frac_tune3,
+            params=initial_params,
+            l_factor=l_factor * thinning,
         )
 
-        wstate.position.xlm.real.block_until_ready()
+        tuned_state.position.xlm.real.block_until_ready()
         t1 = time.perf_counter()
         print()
 
-        warmup_steps = np.array(winfo.info.num_integration_steps)
-        time_per_leapfrog = (t1 - t0) / warmup_steps.sum()
-        mean_steps_end = warmup_steps[-20:].mean()
-        time_per_sample = time_per_leapfrog * mean_steps_end
-        est_sampling_time = num_samples * time_per_sample
+        warmup_integration_steps = warmup_calls * thinning
+        imm = np.array(tuned_params.inverse_mass_matrix)
 
         print(f"Warmup time: {timedelta(seconds=int(t1 - t0))}")
-        print(f"Adapted step size: {parameters['step_size']:.4f}")
+        print(f"Tuned L: {tuned_params.L:.4f}")
+        print(f"Tuned step size: {tuned_params.step_size:.5f}")
         print(
-            f"Mean integration steps (warmup): {warmup_steps.mean():.1f}  |  last 20: {mean_steps_end:.1f}"
+            f"Warmup calls (thinned): {warmup_calls}  |  raw integration steps: {warmup_integration_steps}"
         )
         print(
-            f"Mean acceptance rate (warmup): {jnp.mean(winfo.info.acceptance_rate):.4f}"
-        )
-        print(f"Number of divergences (warmup): {jnp.sum(winfo.info.is_divergent)}")
-        print(
-            f"Estimated sampling time: ~{timedelta(seconds=int(est_sampling_time))}  ({num_samples} samples × ~{time_per_sample:.1f}s/sample)"
+            f"Inv. mass matrix: min={imm.min():.3e}  mean={imm.mean():.3e}  max={imm.max():.3e}"
         )
 
-        nuts = blackjax.nuts(log_prob, **parameters)
+        # blackjax.mclmc(...) bakes the now-fixed L/step_size/inverse_mass_matrix
+        # into a SamplingAlgorithm exposing just .init/.step(rng_key, state) —
+        # no more per-call parameter injection needed, so thin_algorithm
+        # (which wraps a SamplingAlgorithm, not a raw kernel) is the matching
+        # wrapper here.
+        mclmc_sampler = blackjax.mclmc(
+            logdensity_fn=log_prob,
+            L=tuned_params.L,
+            step_size=tuned_params.step_size,
+            inverse_mass_matrix=tuned_params.inverse_mass_matrix,
+        )
+        thinned_sampling_alg = blackjax.util.thin_algorithm(
+            mclmc_sampler, thinning=thinning, info_transform=rms_info
+        )
 
-        key, sample_key = jax.random.split(key)
         print()
         _, (states, infos) = blackjax.util.run_inference_algorithm(
-            rng_key=sample_key,
-            inference_algorithm=nuts,
+            rng_key=key_sample,
+            inference_algorithm=thinned_sampling_alg,
             num_steps=num_samples,
-            initial_state=wstate,
+            initial_state=tuned_state,
             progress_bar=True,
             transform=lambda state, info: (
                 state.position,
-                NUTSInfo(
-                    is_divergent=info.is_divergent,
-                    num_integration_steps=info.num_integration_steps,
-                    acceptance_rate=info.acceptance_rate,
-                    energy=info.energy,
-                    logdensity=state.logdensity,
+                MCLMCInfo(
+                    logdensity=info.logdensity,
+                    energy_change=info.energy_change,
+                    kinetic_change=info.kinetic_change,
+                    nonans=info.nonans,
                 ),
             ),
         )
@@ -414,10 +454,9 @@ class KarmmaSampler:
 
         print(f"Sampling time:    {timedelta(seconds=int(t2 - t1))}")
         print(f"Total time (w+s): {timedelta(seconds=int(t2 - t0))}")
+        print(f"Samples saved:    {num_samples}  (thinned by {thinning})")
         print(
-            f"Mean integration steps: {np.array(infos.num_integration_steps).mean():.1f}"
+            f"Mean |energy change| (RMS-thinned): {np.array(infos.energy_change).mean():.4e}"
         )
-        print(f"Mean acceptance rate: {jnp.mean(infos.acceptance_rate):.4f}")
-        print(f"Number of divergences: {jnp.sum(infos.is_divergent)}")
 
-        return states, infos, parameters, winfo
+        return states, infos, tuned_params, warmup_calls

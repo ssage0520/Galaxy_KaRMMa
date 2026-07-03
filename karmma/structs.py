@@ -22,21 +22,23 @@ class KarmmaPosition(NamedTuple):
     theta: ThetaParams | None = None
 
 
-class NUTSInfo(NamedTuple):
-    is_divergent: jnp.ndarray
-    num_integration_steps: jnp.ndarray
-    acceptance_rate: jnp.ndarray
-    energy: jnp.ndarray
+class MCLMCInfo(NamedTuple):
     logdensity: jnp.ndarray
+    energy_change: jnp.ndarray
+    kinetic_change: jnp.ndarray
+    nonans: jnp.ndarray
 
 
 class McmcConfig(NamedTuple):
-    n_warmup: int
     n_samples: int
     key: Any
     seed: int
-    step_size: float
-    target_acceptance: float
+    frac_tune1: float
+    frac_tune2: float
+    frac_tune3: float
+    l_factor: float
+    thinning: int
+    desired_energy_var: float
     infer_theta: bool
 
 

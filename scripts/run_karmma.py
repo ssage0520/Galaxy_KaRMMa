@@ -11,11 +11,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from karmma import KarmmaConfig, KarmmaSampler
 from karmma.structs import KarmmaPosition, ThetaParams, XlmParams
 
-# Bayesian pseudo-count controlling how much the initial_imm seed persists
-# across warmup windows in blackjax's window_adaptation (requires the
-# jax_karmma_dev blackjax build). See KarmmaSampler.sample.
-IMM_SHRINKAGE_TO_PREVIOUS = 20.0
-
 configfile = sys.argv[1]
 config = KarmmaConfig(configfile)
 
@@ -51,15 +46,17 @@ else:
 print("Computing initial IMM (Schur+CG diagonal estimate) at the initial position ...")
 initial_imm = sampler.initialize_imm(initial_position)
 
-states, infos, mcmc_parameters, winfo = sampler.sample(
+states, infos, tuned_params, warmup_calls = sampler.sample(
     key=mcmc.key,
-    num_warmup=mcmc.n_warmup,
     num_samples=mcmc.n_samples,
-    step_size=mcmc.step_size,
-    target_acceptance_rate=mcmc.target_acceptance,
     initial_position=initial_position,
     initial_imm=initial_imm,
-    imm_shrinkage_to_previous=IMM_SHRINKAGE_TO_PREVIOUS,
+    frac_tune1=mcmc.frac_tune1,
+    frac_tune2=mcmc.frac_tune2,
+    frac_tune3=mcmc.frac_tune3,
+    l_factor=mcmc.l_factor,
+    thinning=mcmc.thinning,
+    desired_energy_var=mcmc.desired_energy_var,
 )
 
 
@@ -78,25 +75,20 @@ with h5.File(os.path.join(io.io_dir, "samples.h5"), "w") as f:
 with h5.File(os.path.join(io.io_dir, "mcmc_metadata.h5"), "w") as f:
     # run info
     f["seed"] = np.array(mcmc.seed)
-    f["step_size"] = np.array(mcmc_parameters["step_size"])
+    f["L"] = np.array(tuned_params.L)
+    f["step_size"] = np.array(tuned_params.step_size)
+    f["inverse_mass_matrix"] = np.array(tuned_params.inverse_mass_matrix)
 
-    # sampling diagnostics
-    f["acceptance_rate"] = np.array(infos.acceptance_rate)
-    f["is_divergent"] = np.array(infos.is_divergent)
-    f["num_integration_steps"] = np.array(infos.num_integration_steps)
-    f["energy"] = np.array(infos.energy)
-
-    # warmup diagnostics
-    f["warmup_acceptance_rate"] = np.array(winfo.info.acceptance_rate)
-    f["warmup_is_divergent"] = np.array(winfo.info.is_divergent)
-    f["warmup_num_integration_steps"] = np.array(winfo.info.num_integration_steps)
-    f["inverse_mass_matrix"] = np.array(mcmc_parameters["inverse_mass_matrix"])
-
-    # initial IMM provenance
-    f["initial_imm"] = np.array(initial_imm)
-    f["imm_shrinkage_to_previous"] = np.array(IMM_SHRINKAGE_TO_PREVIOUS)
-
+    # sampling diagnostics (RMS-aggregated over each block of `thinning` raw steps)
+    f["energy_change"] = np.array(infos.energy_change)
+    f["kinetic_change"] = np.array(infos.kinetic_change)
+    f["nonans"] = np.array(infos.nonans)
     f["log_prob"] = np.array(infos.logdensity)
+
+    # warmup provenance
+    f["warmup_calls"] = np.array(warmup_calls)
+    f["thinning"] = np.array(mcmc.thinning)
+    f["initial_imm"] = np.array(initial_imm)
 
     # fixed bias parameters (only when not sampling theta)
     if not mcmc.infer_theta:

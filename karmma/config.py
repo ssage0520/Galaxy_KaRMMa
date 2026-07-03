@@ -126,7 +126,6 @@ class KarmmaConfig:
         )
 
     def _set_mcmc(self, cfg):
-        n_warmup = int(cfg["n_warmup"])
         n_samples = int(cfg["n_samples"])
 
         seed = cfg.get("seed")
@@ -137,28 +136,26 @@ class KarmmaConfig:
             seed = int(seed)
         key = jax.random.PRNGKey(seed)
 
-        step_size = cfg.get("init_step_size")
-        if step_size is None:
-            step_size = 0.05
-            print("No step size provided — using default: 0.05")
-        else:
-            step_size = float(step_size)
-
-        target_acceptance = cfg.get("target_acceptance_rate")
-        if target_acceptance is None:
-            target_acceptance = 0.65
-            print("No target acceptance rate provided — using default: 0.65")
-        else:
-            target_acceptance = float(target_acceptance)
+        frac_tune1 = float(cfg.get("frac_tune1", 0.1))
+        # 0.3, not blackjax's stock 0.1 — validated in dev_notebooks/mclmc.ipynb
+        # to give diagonal preconditioning enough samples to converge.
+        frac_tune2 = float(cfg.get("frac_tune2", 0.3))
+        frac_tune3 = float(cfg.get("frac_tune3", 0.1))
+        l_factor = float(cfg.get("l_factor", 0.4))
+        thinning = int(cfg.get("thinning", 5))
+        desired_energy_var = float(cfg.get("desired_energy_var", 5e-4))
 
         infer_theta = bool(cfg.get("infer_theta", False))
 
         return McmcConfig(
-            n_warmup=n_warmup,
             n_samples=n_samples,
             key=key,
             seed=seed,
-            step_size=step_size,
-            target_acceptance=target_acceptance,
+            frac_tune1=frac_tune1,
+            frac_tune2=frac_tune2,
+            frac_tune3=frac_tune3,
+            l_factor=l_factor,
+            thinning=thinning,
+            desired_energy_var=desired_energy_var,
             infer_theta=infer_theta,
         )
