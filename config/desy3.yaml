@@ -15,10 +15,11 @@ io:
 mcmc:
     infer_theta: true
     seed: null
-    n_samples: 400
+    n_samples: 1500
     frac_tune1: 0.1
     frac_tune2: 0.3
     frac_tune3: 0.1
     l_factor: 0.4
-    thinning: 5
+    thinning_warmup: 4
+    thinning_sampling: 50
     desired_energy_var: 0.0005

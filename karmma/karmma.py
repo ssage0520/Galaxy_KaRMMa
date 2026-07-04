@@ -328,7 +328,8 @@ class KarmmaSampler:
         frac_tune3: float = 0.1,
         l_factor: float = 0.4,
         desired_energy_var: float = 5e-4,
-        thinning: int = 5,
+        thinning_warmup: int = 5,
+        thinning_sampling: int = 5,
     ):
         """Runs MCLMC, seeding its diagonal preconditioner from `initial_imm`.
 
@@ -341,13 +342,25 @@ class KarmmaSampler:
         layout, e.g. as returned by `initialize_imm`.
 
         `num_samples` is the number of samples actually saved (post-thinning),
-        not a raw integrator-step budget. Warmup is sized as a fraction of
-        that same number — (frac_tune1 + frac_tune2 + frac_tune3) * num_samples
-        thinned calls — there is no separate warmup count, since MCLMC's own
-        tuning routine splits one `num_steps` budget into its three phases
-        internally. This mirrors dev_notebooks/mclmc.ipynb's validated
-        thin_kernel/thin_algorithm usage; don't re-derive the unit
-        conversions (e.g. `l_factor * thinning`) independently.
+        not a raw integrator-step budget.
+
+        `thinning_warmup`/`thinning_sampling` are independent: sampling-side
+        thinning trades wall-clock for less autocorrelation between stored
+        samples at no memory cost, while warmup-side thinning trades slower
+        step-size-adaptation feedback for less-autocorrelated draws feeding
+        the diagonal-preconditioner (IMM) and L/ESS estimators.
+
+        `mclmc_find_L_and_step_size`'s `num_steps` argument is a *scale*, not
+        a call count — frac_tune1/2/3 each multiply it internally to get
+        that phase's actual length. When thinning_warmup == thinning_sampling,
+        passing num_samples directly for that scale makes warmup's actual
+        raw-step compute a fixed frac_tune-fraction of sampling's raw-step
+        compute, because the shared thinning cancels out of that ratio. Now
+        that the two can differ, we correct for the ratio explicitly so it
+        stays fixed regardless of the two thinning choices — this reduces to
+        `num_steps=num_samples` exactly when thinning_warmup == thinning_sampling.
+        Don't pass num_samples directly to mclmc_find_L_and_step_size once
+        the two thinning values are allowed to differ.
         """
 
         log_prob = jax.jit(self.log_prob)
@@ -371,7 +384,7 @@ class KarmmaSampler:
                 integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
                 desired_energy_var=desired_energy_var,
             ),
-            thinning=thinning,
+            thinning=thinning_warmup,
             info_transform=rms_info,
         )
 
@@ -384,11 +397,13 @@ class KarmmaSampler:
             inverse_mass_matrix=initial_imm,
         )
 
+        num_steps_warmup = round(num_samples * thinning_sampling / thinning_warmup)
+
         print()
         tuned_state, tuned_params, warmup_calls = blackjax.mclmc_find_L_and_step_size(
             mclmc_kernel=thinned_kernel,
             logdensity_fn=log_prob,
-            num_steps=num_samples,
+            num_steps=num_steps_warmup,
             state=init_state,
             rng_key=key_warmup,
             diagonal_preconditioning=True,
@@ -396,14 +411,14 @@ class KarmmaSampler:
             frac_tune2=frac_tune2,
             frac_tune3=frac_tune3,
             params=initial_params,
-            l_factor=l_factor * thinning,
+            l_factor=l_factor * thinning_warmup,
         )
 
         tuned_state.position.xlm.real.block_until_ready()
         t1 = time.perf_counter()
         print()
 
-        warmup_integration_steps = warmup_calls * thinning
+        warmup_integration_steps = warmup_calls * thinning_warmup
         imm = np.array(tuned_params.inverse_mass_matrix)
 
         print(f"Warmup time: {timedelta(seconds=int(t1 - t0))}")
@@ -428,7 +443,7 @@ class KarmmaSampler:
             inverse_mass_matrix=tuned_params.inverse_mass_matrix,
         )
         thinned_sampling_alg = blackjax.util.thin_algorithm(
-            mclmc_sampler, thinning=thinning, info_transform=rms_info
+            mclmc_sampler, thinning=thinning_sampling, info_transform=rms_info
         )
 
         print()
@@ -454,7 +469,10 @@ class KarmmaSampler:
 
         print(f"Sampling time:    {timedelta(seconds=int(t2 - t1))}")
         print(f"Total time (w+s): {timedelta(seconds=int(t2 - t0))}")
-        print(f"Samples saved:    {num_samples}  (thinned by {thinning})")
+        print(
+            f"Samples saved:    {num_samples}  "
+            f"(thinned by {thinning_sampling} for sampling, {thinning_warmup} for warmup)"
+        )
         print(
             f"Mean |energy change| (RMS-thinned): {np.array(infos.energy_change).mean():.4e}"
         )

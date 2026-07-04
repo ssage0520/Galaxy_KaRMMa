@@ -55,7 +55,8 @@ states, infos, tuned_params, warmup_calls = sampler.sample(
     frac_tune2=mcmc.frac_tune2,
     frac_tune3=mcmc.frac_tune3,
     l_factor=mcmc.l_factor,
-    thinning=mcmc.thinning,
+    thinning_warmup=mcmc.thinning_warmup,
+    thinning_sampling=mcmc.thinning_sampling,
     desired_energy_var=mcmc.desired_energy_var,
 )
 
@@ -79,7 +80,7 @@ with h5.File(os.path.join(io.io_dir, "mcmc_metadata.h5"), "w") as f:
     f["step_size"] = np.array(tuned_params.step_size)
     f["inverse_mass_matrix"] = np.array(tuned_params.inverse_mass_matrix)
 
-    # sampling diagnostics (RMS-aggregated over each block of `thinning` raw steps)
+    # sampling diagnostics (RMS-aggregated over each block of `thinning_sampling` raw steps)
     f["energy_change"] = np.array(infos.energy_change)
     f["kinetic_change"] = np.array(infos.kinetic_change)
     f["nonans"] = np.array(infos.nonans)
@@ -87,7 +88,8 @@ with h5.File(os.path.join(io.io_dir, "mcmc_metadata.h5"), "w") as f:
 
     # warmup provenance
     f["warmup_calls"] = np.array(warmup_calls)
-    f["thinning"] = np.array(mcmc.thinning)
+    f["thinning_warmup"] = np.array(mcmc.thinning_warmup)
+    f["thinning_sampling"] = np.array(mcmc.thinning_sampling)
     f["initial_imm"] = np.array(initial_imm)
 
     # fixed bias parameters (only when not sampling theta)

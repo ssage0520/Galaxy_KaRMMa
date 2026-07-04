@@ -142,7 +142,8 @@ class KarmmaConfig:
         frac_tune2 = float(cfg.get("frac_tune2", 0.3))
         frac_tune3 = float(cfg.get("frac_tune3", 0.1))
         l_factor = float(cfg.get("l_factor", 0.4))
-        thinning = int(cfg.get("thinning", 5))
+        thinning_warmup = int(cfg.get("thinning_warmup", 5))
+        thinning_sampling = int(cfg.get("thinning_sampling", 5))
         desired_energy_var = float(cfg.get("desired_energy_var", 5e-4))
 
         infer_theta = bool(cfg.get("infer_theta", False))
@@ -155,7 +156,8 @@ class KarmmaConfig:
             frac_tune2=frac_tune2,
             frac_tune3=frac_tune3,
             l_factor=l_factor,
-            thinning=thinning,
+            thinning_warmup=thinning_warmup,
+            thinning_sampling=thinning_sampling,
             desired_energy_var=desired_energy_var,
             infer_theta=infer_theta,
         )

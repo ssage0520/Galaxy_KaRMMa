@@ -37,7 +37,8 @@ class McmcConfig(NamedTuple):
     frac_tune2: float
     frac_tune3: float
     l_factor: float
-    thinning: int
+    thinning_warmup: int
+    thinning_sampling: int
     desired_energy_var: float
     infer_theta: bool
 
