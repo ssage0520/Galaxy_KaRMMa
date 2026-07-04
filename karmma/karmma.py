@@ -379,10 +379,16 @@ class KarmmaSampler:
         # changes L/step_size/inverse_mass_matrix between calls as it tunes
         # them, so it must inject the current guess at each call rather than
         # working through a SamplingAlgorithm with those values baked in.
+        # desired_energy_var isn't passed here: build_kernel only uses it for
+        # the high-energy rejection cutoff (eev_max_per_dim =
+        # desired_energy_var_max_ratio * desired_energy_var), which we never
+        # enable (desired_energy_var_max_ratio defaults to inf, so that
+        # product is always infinite regardless of this value). Its real
+        # functional role — the step-size dual-averaging target — is on
+        # mclmc_find_L_and_step_size's own desired_energy_var below.
         thinned_kernel = blackjax.util.thin_kernel(
             blackjax.mcmc.mclmc.build_kernel(
                 integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
-                desired_energy_var=desired_energy_var,
             ),
             thinning=thinning_warmup,
             info_transform=rms_info,
@@ -410,6 +416,7 @@ class KarmmaSampler:
             frac_tune1=frac_tune1,
             frac_tune2=frac_tune2,
             frac_tune3=frac_tune3,
+            desired_energy_var=desired_energy_var,
             params=initial_params,
             l_factor=l_factor * thinning_warmup,
         )
