@@ -239,18 +239,12 @@ class KarmmaSampler:
         Marginalises over the xlm block with n_theta CG solves against H_xx,
         fixes the resulting indefinite n_theta×n_theta Schur complement to PD
         via |λ| eigenvalue correction, and assembles the full N_full-length
-        diagonal IMM expected by BlackJax.
+        diagonal IMM expected by BlackJax: xlm block → 1.0 (consistent with
+        the N(0,1) prior), theta block → Schur+CG estimate with |λ| fix.
 
-        xlm block  → 1.0  (consistent with the N(0,1) prior)
-        theta block → Schur+CG estimate with |λ| fix
-
-        Requires `infer_theta=True` (theta must be part of the sampled
-        position for the Schur complement over the theta block to apply).
-
-        Returns
-        -------
-        np.ndarray of shape (n_x + n_theta,) in BlackJax pytree-flat layout:
-            [xlm.real.ravel(), xlm.imag.ravel(), theta fields in ThetaParams order]
+        Requires `infer_theta=True`. Returns an array of shape
+        (n_x + n_theta,) in BlackJax pytree-flat layout:
+        [xlm.real.ravel(), xlm.imag.ravel(), theta fields in ThetaParams order].
         """
         n_theta = len(ThetaParams._fields) * self.Nbins
 
@@ -283,6 +277,12 @@ class KarmmaSampler:
         H_bx_est = rows_b[:, :n_x]
 
         if verbose:
+            n_finite = int(jnp.sum(jnp.all(jnp.isfinite(rows_b), axis=1)))
+            abs_rows_b = jnp.abs(rows_b)
+            print(
+                f"  HVP finiteness: {n_finite}/{n_theta} finite  |  "
+                f"|HVP| range: min={abs_rows_b.min():.2e} max={abs_rows_b.max():.2e}"
+            )
             print(
                 f"initialize_imm: step 2 — {n_theta} CG solves "
                 f"(tol={tol}, maxiter={maxiter}) ...",
@@ -315,6 +315,15 @@ class KarmmaSampler:
         w_fixed = jnp.clip(jnp.abs(w), a_min=float(jnp.max(jnp.abs(w))) / kappa_max)
         imm_theta = np.array(jnp.diag((U / w_fixed) @ U.T))
 
+        if verbose:
+            finite = bool(np.all(np.isfinite(imm_theta)))
+            all_positive = bool(np.all(imm_theta > 0))
+            print(
+                f"  IMM (theta block): min={imm_theta.min():.3e}  "
+                f"mean={imm_theta.mean():.3e}  max={imm_theta.max():.3e}  |  "
+                f"finite={finite}  all_positive={all_positive}"
+            )
+
         return np.concatenate([np.ones(n_x), imm_theta])
 
     def sample(
@@ -333,66 +342,40 @@ class KarmmaSampler:
     ):
         """Runs MCLMC, seeding its diagonal preconditioner from `initial_imm`.
 
-        Requires the jax_karmma_dev blackjax build — its `mclmc.build_kernel`
-        no longer bakes `logdensity_fn`/`inverse_mass_matrix` into the kernel
-        closure (they're call-time args instead), and `mclmc_find_L_and_step_size`
-        takes `logdensity_fn` explicitly and `l_factor` (not `Lfactor`).
-
+        Requires the jax_karmma_dev blackjax build (mclmc's call-time kernel
+        args, mclmc_find_L_and_step_size's logdensity_fn/l_factor kwargs).
         `initial_imm` must be a 1-D diagonal IMM in BlackJax pytree-flat
-        layout, e.g. as returned by `initialize_imm`.
+        layout, e.g. as returned by `initialize_imm`. `num_samples` is the
+        number of samples actually saved (post-thinning), not a raw
+        integrator-step budget.
 
-        `num_samples` is the number of samples actually saved (post-thinning),
-        not a raw integrator-step budget.
+        Warmup runs as two chained `mclmc_find_L_and_step_size` calls, since
+        phases 1+2 and phase 3 want opposite thinning:
 
-        `thinning_warmup`/`thinning_sampling` are independent: sampling-side
-        thinning trades wall-clock for less autocorrelation between stored
-        samples at no memory cost, while warmup-side thinning trades slower
-        step-size-adaptation feedback for less-autocorrelated draws feeding
-        the diagonal-preconditioner (IMM) and L/ESS estimators.
+        - Phases 1+2 (step size + diagonal IMM) always run unthinned — they
+          only carry O(dim) running accumulators, so thinning gains nothing
+          and only coarsens the step-size feedback.
+        - Phase 3 (L via effective-sample-size) is thinned by
+          `thinning_warmup`, since its FFT-based ESS calculation over the
+          full position is what actually blows up memory at scale, while its
+          estimate is fairly insensitive to draw spacing.
 
-        `mclmc_find_L_and_step_size`'s `num_steps` argument is a *scale*, not
-        a call count — frac_tune1/2/3 each multiply it internally to get
-        that phase's actual length. When thinning_warmup == thinning_sampling,
-        passing num_samples directly for that scale makes warmup's actual
-        raw-step compute a fixed frac_tune-fraction of sampling's raw-step
-        compute, because the shared thinning cancels out of that ratio. Now
-        that the two can differ, we correct for the ratio explicitly so it
-        stays fixed regardless of the two thinning choices — this reduces to
-        `num_steps=num_samples` exactly when thinning_warmup == thinning_sampling.
-        Don't pass num_samples directly to mclmc_find_L_and_step_size once
-        the two thinning values are allowed to differ.
+        Call 2 is seeded from call 1's tuned `state`/`params` (not
+        `init_state`/`initial_params`) so phase 3 continues the chain instead
+        of restarting cold.
         """
 
+        # jax.jit matters here since mclmc.init isn't itself jit-decorated;
+        # elsewhere the enclosing lax.scan compiles everything regardless.
         log_prob = jax.jit(self.log_prob)
         dim = blackjax.util.pytree_size(initial_position)
 
         t0 = time.perf_counter()
 
-        key, key_init, key_warmup, key_sample = jax.random.split(key, 4)
+        key, key_init, key_warmup1, key_warmup2, key_sample = jax.random.split(key, 5)
 
         def rms_info(info):
             return jax.tree.map(lambda x: (x**2).mean() ** 0.5, info)
-
-        # thin_kernel wraps the raw kernel(rng_key, state, logdensity_fn,
-        # inverse_mass_matrix, L, step_size) signature from build_kernel —
-        # needed for warmup because mclmc_find_L_and_step_size actively
-        # changes L/step_size/inverse_mass_matrix between calls as it tunes
-        # them, so it must inject the current guess at each call rather than
-        # working through a SamplingAlgorithm with those values baked in.
-        # desired_energy_var isn't passed here: build_kernel only uses it for
-        # the high-energy rejection cutoff (eev_max_per_dim =
-        # desired_energy_var_max_ratio * desired_energy_var), which we never
-        # enable (desired_energy_var_max_ratio defaults to inf, so that
-        # product is always infinite regardless of this value). Its real
-        # functional role — the step-size dual-averaging target — is on
-        # mclmc_find_L_and_step_size's own desired_energy_var below.
-        thinned_kernel = blackjax.util.thin_kernel(
-            blackjax.mcmc.mclmc.build_kernel(
-                integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
-            ),
-            thinning=thinning_warmup,
-            info_transform=rms_info,
-        )
 
         init_state = blackjax.mcmc.mclmc.init(
             position=initial_position, logdensity_fn=log_prob, rng_key=key_init
@@ -403,21 +386,71 @@ class KarmmaSampler:
             inverse_mass_matrix=initial_imm,
         )
 
-        num_steps_warmup = round(num_samples * thinning_sampling / thinning_warmup)
+        # desired_energy_var only matters via mclmc_find_L_and_step_size's own
+        # kwarg (the step-size dual-averaging target) — build_kernel's use of
+        # it is dead unless desired_energy_var_max_ratio is also set, which
+        # we don't do, so it's passed only to the calls below.
 
+        # Call 1: phases 1+2 only, always unthinned — raw kernel, since
+        # thinning=1 needs no thin_kernel wrapper.
         print()
-        tuned_state, tuned_params, warmup_calls = blackjax.mclmc_find_L_and_step_size(
-            mclmc_kernel=thinned_kernel,
+        state_12, params_12, warmup_calls_12 = blackjax.mclmc_find_L_and_step_size(
+            mclmc_kernel=blackjax.mcmc.mclmc.build_kernel(
+                integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
+            ),
             logdensity_fn=log_prob,
-            num_steps=num_steps_warmup,
+            num_steps=round(num_samples * thinning_sampling),
             state=init_state,
-            rng_key=key_warmup,
+            rng_key=key_warmup1,
             diagonal_preconditioning=True,
             frac_tune1=frac_tune1,
             frac_tune2=frac_tune2,
-            frac_tune3=frac_tune3,
+            frac_tune3=0.0,
             desired_energy_var=desired_energy_var,
             params=initial_params,
+            l_factor=l_factor,
+        )
+
+        imm_12 = np.array(params_12.inverse_mass_matrix)
+        step_size_12_finite = bool(np.isfinite(params_12.step_size))
+        imm_12_finite = bool(np.all(np.isfinite(imm_12)))
+        imm_12_positive = bool(np.all(imm_12 > 0))
+        flat_init, _ = jax.flatten_util.ravel_pytree(initial_position)
+        flat_state_12, _ = jax.flatten_util.ravel_pytree(state_12.position)
+        max_delta_12 = float(jnp.max(jnp.abs(flat_state_12 - flat_init)))
+
+        print(
+            f"[Phases 1+2] Tuned step size: {params_12.step_size:.5f}  "
+            f"(finite={step_size_12_finite})"
+        )
+        print(
+            f"[Phases 1+2] Inv. mass matrix: min={imm_12.min():.3e}  "
+            f"mean={imm_12.mean():.3e}  max={imm_12.max():.3e}  "
+            f"(finite={imm_12_finite}, all_positive={imm_12_positive})"
+        )
+        print(f"[Phases 1+2] Max |Δ position| from init: {max_delta_12:.3e}")
+
+        # Call 2: phase 3 only, thinned by thinning_warmup, seeded from
+        # call 1's state/params so it continues the tuned chain.
+        print()
+        tuned_state, tuned_params, warmup_calls_3 = blackjax.mclmc_find_L_and_step_size(
+            mclmc_kernel=blackjax.util.thin_kernel(
+                blackjax.mcmc.mclmc.build_kernel(
+                    integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
+                ),
+                thinning=thinning_warmup,
+                info_transform=rms_info,
+            ),
+            logdensity_fn=log_prob,
+            num_steps=round(num_samples * thinning_sampling / thinning_warmup),
+            state=state_12,
+            rng_key=key_warmup2,
+            diagonal_preconditioning=True,
+            frac_tune1=0.0,
+            frac_tune2=0.0,
+            frac_tune3=frac_tune3,
+            desired_energy_var=desired_energy_var,
+            params=params_12,
             l_factor=l_factor * thinning_warmup,
         )
 
@@ -425,24 +458,47 @@ class KarmmaSampler:
         t1 = time.perf_counter()
         print()
 
-        warmup_integration_steps = warmup_calls * thinning_warmup
+        # Confirms phase 3 didn't reset step_size/IMM (printed, not
+        # asserted, so it can't crash a run).
+        step_size_preserved = bool(
+            np.array(tuned_params.step_size) == np.array(params_12.step_size)
+        )
+        imm_preserved = bool(
+            np.array_equal(
+                np.array(tuned_params.inverse_mass_matrix),
+                np.array(params_12.inverse_mass_matrix),
+            )
+        )
+        print(
+            f"step_size/IMM unchanged by phase 3: "
+            f"step_size={step_size_preserved}  inverse_mass_matrix={imm_preserved}"
+        )
+
+        warmup_calls = warmup_calls_12 + warmup_calls_3
+        warmup_integration_steps = (
+            warmup_calls_12 * 1 + warmup_calls_3 * thinning_warmup
+        )
         imm = np.array(tuned_params.inverse_mass_matrix)
 
+        L_finite = bool(np.isfinite(tuned_params.L))
         print(f"Warmup time: {timedelta(seconds=int(t1 - t0))}")
-        print(f"Tuned L: {tuned_params.L:.4f}")
+        print(f"Tuned L: {tuned_params.L:.4f}  (finite={L_finite})")
         print(f"Tuned step size: {tuned_params.step_size:.5f}")
         print(
-            f"Warmup calls (thinned): {warmup_calls}  |  raw integration steps: {warmup_integration_steps}"
+            f"Steps per trajectory (L / step_size): "
+            f"{tuned_params.L / tuned_params.step_size:.2f}"
+        )
+        print(
+            f"Warmup calls (thinned): {warmup_calls}  "
+            f"(phases 1+2: {warmup_calls_12}, phase 3: {warmup_calls_3})  |  "
+            f"raw integration steps: {warmup_integration_steps}"
         )
         print(
             f"Inv. mass matrix: min={imm.min():.3e}  mean={imm.mean():.3e}  max={imm.max():.3e}"
         )
 
-        # blackjax.mclmc(...) bakes the now-fixed L/step_size/inverse_mass_matrix
-        # into a SamplingAlgorithm exposing just .init/.step(rng_key, state) —
-        # no more per-call parameter injection needed, so thin_algorithm
-        # (which wraps a SamplingAlgorithm, not a raw kernel) is the matching
-        # wrapper here.
+        # Bakes the tuned L/step_size/IMM into a fixed SamplingAlgorithm;
+        # thin_algorithm (not thin_kernel) wraps that.
         mclmc_sampler = blackjax.mclmc(
             logdensity_fn=log_prob,
             L=tuned_params.L,
@@ -478,10 +534,11 @@ class KarmmaSampler:
         print(f"Total time (w+s): {timedelta(seconds=int(t2 - t0))}")
         print(
             f"Samples saved:    {num_samples}  "
-            f"(thinned by {thinning_sampling} for sampling, {thinning_warmup} for warmup)"
+            f"(thinned by {thinning_sampling} for sampling, {thinning_warmup} for warmup phase 3 only)"
         )
         print(
             f"Mean |energy change| (RMS-thinned): {np.array(infos.energy_change).mean():.4e}"
         )
+        print(f"Fraction of non-NaN steps: {np.array(infos.nonans).mean():.4f}")
 
         return states, infos, tuned_params, warmup_calls
