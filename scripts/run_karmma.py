@@ -55,7 +55,7 @@ sampler.build_theta_reparam(dense_theta_matrix, initial_position.theta)
 sampling_position = WhitenedKarmmaPosition(
     xlm=initial_position.xlm, phi=sampler.theta_to_phi(initial_position.theta)
 )
-initial_imm = np.ones(jax.flatten_util.ravel_pytree(initial_position)[0].shape[0])
+initial_imm = np.ones(jax.flatten_util.ravel_pytree(sampling_position)[0].shape[0])
 
 states, infos, mcmc_parameters, winfo = sampler.sample(
     key=mcmc.key,

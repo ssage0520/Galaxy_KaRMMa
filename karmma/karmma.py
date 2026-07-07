@@ -394,14 +394,17 @@ class KarmmaSampler:
         jax_karmma_dev environment) — stock blackjax (jax_karmma) raises a
         TypeError.
 
-        `initial_imm` must be a 1-D diagonal IMM in BlackJax pytree-flat
-        layout, e.g. as returned by `initialize_imm`.
-
         Always samples theta in the whitened eigenbasis (see
         build_theta_reparam, which must be called first): `initial_position`
-        is a WhitenedKarmmaPosition (xlm + phi), and the returned `states` is
-        converted back to a physical-coordinate KarmmaPosition (theta, not
-        phi) before returning, so callers never see phi-space values.
+        is a WhitenedKarmmaPosition (xlm + phi), and `initial_imm` must be a
+        1-D diagonal IMM in BlackJax pytree-flat layout *for that whitened
+        position* — typically `np.ones(N_full)`, since phi is already
+        whitened to ~unit variance. Do NOT pass `initialize_imm`'s output
+        here: that's scaled for physical theta (down to ~1e-8 in some
+        directions) and would badly under-precondition phi-space. The
+        returned `states` is converted back to a physical-coordinate
+        KarmmaPosition (theta, not phi) before returning, so callers never
+        see phi-space values.
         `mcmc_parameters["inverse_mass_matrix"]`'s theta block is phi-space-
         scaled (expected, not a bug — needed to interpret it as a diagnostic
         later), but `infos.logdensity`/`winfo`'s log-density values remain in
