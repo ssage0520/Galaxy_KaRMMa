@@ -10,7 +10,12 @@ import h5py as h5
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from karmma import KarmmaConfig, KarmmaSampler
-from karmma.structs import KarmmaPosition, ThetaParams, WhitenedKarmmaPosition, XlmParams
+from karmma.structs import (
+    KarmmaPosition,
+    ThetaParams,
+    WhitenedKarmmaPosition,
+    XlmParams,
+)
 
 # Bayesian pseudo-count controlling how much the initial_imm seed persists
 # across warmup windows in blackjax's window_adaptation (requires the
@@ -49,7 +54,9 @@ if io.initial_position.xlm is None:
 else:
     initial_position = io.initial_position
 
-print("Computing dense theta covariance (Schur+CG) for eigenbasis reparametrization ...")
+print(
+    "Computing dense theta covariance (Schur+CG) for eigenbasis reparametrization ..."
+)
 dense_theta_matrix = sampler.dense_theta_imm(initial_position)
 sampler.build_theta_reparam(dense_theta_matrix, initial_position.theta)
 sampling_position = WhitenedKarmmaPosition(
