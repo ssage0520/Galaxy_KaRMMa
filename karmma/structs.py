@@ -22,6 +22,11 @@ class KarmmaPosition(NamedTuple):
     theta: ThetaParams | None = None
 
 
+class WhitenedKarmmaPosition(NamedTuple):
+    xlm: XlmParams
+    phi: jnp.ndarray  # (n_theta,) flat whitened bias parameters
+
+
 class NUTSInfo(NamedTuple):
     is_divergent: jnp.ndarray
     num_integration_steps: jnp.ndarray

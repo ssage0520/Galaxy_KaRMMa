@@ -14,7 +14,13 @@ from blackjax.adaptation.base import get_filter_adapt_info_fn
 from jax.scipy.sparse.linalg import cg
 from scipy.special import legendre_p_all, roots_legendre
 
-from karmma.structs import KarmmaPosition, NUTSInfo, ThetaParams, XlmParams
+from karmma.structs import (
+    KarmmaPosition,
+    NUTSInfo,
+    ThetaParams,
+    WhitenedKarmmaPosition,
+    XlmParams,
+)
 from karmma.transforms import alm2map, map2alm
 
 _INVGAMMA_ALPHA_R = 1.0  # TODO: expose in McmcConfig
@@ -64,6 +70,11 @@ class KarmmaSampler:
         self.gen_ell, self.gen_emm = hp.Alm.getlm(self.gen_lmax)
 
         self.pixwin = pixwin
+
+        # Eigenbasis whitening transform for theta, set by build_theta_reparam.
+        self.V = None
+        self.w = None
+        self.theta0 = None
 
         self.compute_CL_G()
 
@@ -226,7 +237,7 @@ class KarmmaSampler:
             + log_lik
         )
 
-    def initialize_imm(
+    def dense_theta_imm(
         self,
         position: KarmmaPosition,
         tol: float = 1e-3,
@@ -234,23 +245,21 @@ class KarmmaSampler:
         kappa_max: float = 1e9,
         verbose: bool = True,
     ) -> np.ndarray:
-        """Diagonal IMM for NUTS warm-start via Schur complement + CG.
+        """Dense theta-only covariance-like matrix via Schur complement + CG.
 
         Marginalises over the xlm block with n_theta CG solves against H_xx,
-        fixes the resulting indefinite n_theta×n_theta Schur complement to PD
-        via |λ| eigenvalue correction, and assembles the full N_full-length
-        diagonal IMM expected by BlackJax.
-
-        xlm block  → 1.0  (consistent with the N(0,1) prior)
-        theta block → Schur+CG estimate with |λ| fix
+        then fixes the resulting indefinite n_theta×n_theta Schur complement
+        to PD via |λ| eigenvalue correction. Used directly for eigenbasis
+        reparametrization (see build_theta_reparam), or reduced to a
+        diagonal by initialize_imm for a diagonal-only IMM seed instead.
 
         Requires `infer_theta=True` (theta must be part of the sampled
         position for the Schur complement over the theta block to apply).
 
         Returns
         -------
-        np.ndarray of shape (n_x + n_theta,) in BlackJax pytree-flat layout:
-            [xlm.real.ravel(), xlm.imag.ravel(), theta fields in ThetaParams order]
+        np.ndarray of shape (n_theta, n_theta), field-major/bin-minor layout
+        matching jax.flatten_util.ravel_pytree(ThetaParams(...)).
         """
         n_theta = len(ThetaParams._fields) * self.Nbins
 
@@ -274,7 +283,7 @@ class KarmmaSampler:
 
         if verbose:
             print(
-                f"initialize_imm: step 1 — {n_theta} b-indicator HVPs ...", flush=True
+                f"dense_theta_imm: step 1 — {n_theta} b-indicator HVPs ...", flush=True
             )
         rows_b = jnp.stack(
             [_hvp(jnp.zeros(N_full).at[n_x + i].set(1.0)) for i in range(n_theta)]
@@ -284,7 +293,7 @@ class KarmmaSampler:
 
         if verbose:
             print(
-                f"initialize_imm: step 2 — {n_theta} CG solves "
+                f"dense_theta_imm: step 2 — {n_theta} CG solves "
                 f"(tol={tol}, maxiter={maxiter}) ...",
                 flush=True,
             )
@@ -313,16 +322,66 @@ class KarmmaSampler:
         S = 0.5 * (precision_bb + precision_bb.T)
         w, U = jnp.linalg.eigh(S)
         w_fixed = jnp.clip(jnp.abs(w), a_min=float(jnp.max(jnp.abs(w))) / kappa_max)
-        imm_theta = np.array(jnp.diag((U / w_fixed) @ U.T))
 
-        return np.concatenate([np.ones(n_x), imm_theta])
+        return np.array((U / w_fixed) @ U.T)
+
+    def initialize_imm(
+        self,
+        position: KarmmaPosition,
+        tol: float = 1e-3,
+        maxiter: int = 300,
+        kappa_max: float = 1e9,
+        verbose: bool = True,
+    ) -> np.ndarray:
+        """Diagonal IMM for NUTS warm-start via Schur complement + CG.
+
+        xlm block  → 1.0  (consistent with the N(0,1) prior)
+        theta block → diagonal of dense_theta_imm's dense matrix
+
+        Requires `infer_theta=True` (theta must be part of the sampled
+        position for the Schur complement over the theta block to apply).
+
+        Returns
+        -------
+        np.ndarray of shape (n_x + n_theta,) in BlackJax pytree-flat layout:
+            [xlm.real.ravel(), xlm.imag.ravel(), theta fields in ThetaParams order]
+        """
+        n_theta = len(ThetaParams._fields) * self.Nbins
+        n_x = jax.flatten_util.ravel_pytree(position)[0].shape[0] - n_theta
+        dense = self.dense_theta_imm(position, tol, maxiter, kappa_max, verbose)
+        return np.concatenate([np.ones(n_x), np.diag(dense)])
+
+    def build_theta_reparam(
+        self, dense_theta_matrix: np.ndarray, theta0: ThetaParams
+    ) -> None:
+        """Eigendecomposes a dense theta covariance estimate (e.g.
+        self.dense_theta_imm(...)'s output) and stores the whitening
+        transform (self.V, self.w, self.theta0) for theta_to_phi/
+        phi_to_theta and sample(), which requires this to have been called
+        first."""
+        self.w, self.V = jnp.linalg.eigh(jnp.asarray(dense_theta_matrix))
+        self.theta0 = theta0
+
+    def theta_to_phi(self, theta: ThetaParams) -> jnp.ndarray:
+        """Physical theta -> whitened phi, via the eigenbasis transform set
+        by build_theta_reparam."""
+        theta_flat, _ = jax.flatten_util.ravel_pytree(theta)
+        theta0_flat, _ = jax.flatten_util.ravel_pytree(self.theta0)
+        return (self.V.T @ (theta_flat - theta0_flat)) / jnp.sqrt(self.w)
+
+    def phi_to_theta(self, phi: jnp.ndarray) -> ThetaParams:
+        """Whitened phi -> physical theta, via the eigenbasis transform set
+        by build_theta_reparam."""
+        theta0_flat, unravel = jax.flatten_util.ravel_pytree(self.theta0)
+        theta_flat = theta0_flat + self.V @ (phi * jnp.sqrt(self.w))
+        return unravel(theta_flat)
 
     def sample(
         self,
         key,
         num_warmup,
         num_samples,
-        initial_position: KarmmaPosition,
+        initial_position: WhitenedKarmmaPosition,
         initial_imm: np.ndarray,
         imm_shrinkage_to_previous: float = 0.0,
         step_size=0.05,
@@ -337,9 +396,28 @@ class KarmmaSampler:
 
         `initial_imm` must be a 1-D diagonal IMM in BlackJax pytree-flat
         layout, e.g. as returned by `initialize_imm`.
-        """
 
-        log_prob = jax.jit(self.log_prob)
+        Always samples theta in the whitened eigenbasis (see
+        build_theta_reparam, which must be called first): `initial_position`
+        is a WhitenedKarmmaPosition (xlm + phi), and the returned `states` is
+        converted back to a physical-coordinate KarmmaPosition (theta, not
+        phi) before returning, so callers never see phi-space values.
+        `mcmc_parameters["inverse_mass_matrix"]`'s theta block is phi-space-
+        scaled (expected, not a bug — needed to interpret it as a diagnostic
+        later), but `infos.logdensity`/`winfo`'s log-density values remain in
+        true physical units regardless, since the wrapped log_prob below
+        evaluates `self.log_prob` at the untransformed point, adding no
+        constant (the phi -> theta map is linear with a phi-independent
+        Jacobian, which doesn't affect NUTS/HMC dynamics or acceptance).
+        """
+        if self.V is None:
+            raise ValueError("Call build_theta_reparam(...) before sample().")
+
+        def log_prob(params: WhitenedKarmmaPosition):
+            theta = self.phi_to_theta(params.phi)
+            return self.log_prob(KarmmaPosition(xlm=params.xlm, theta=theta))
+
+        log_prob = jax.jit(log_prob)
 
         t0 = time.perf_counter()
 
@@ -419,5 +497,8 @@ class KarmmaSampler:
         )
         print(f"Mean acceptance rate: {jnp.mean(infos.acceptance_rate):.4f}")
         print(f"Number of divergences: {jnp.sum(infos.is_divergent)}")
+
+        theta = jax.vmap(self.phi_to_theta)(states.phi)
+        states = KarmmaPosition(xlm=states.xlm, theta=theta)
 
         return states, infos, parameters, winfo

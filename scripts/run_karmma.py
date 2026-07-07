@@ -2,6 +2,7 @@ import os
 import sys
 
 import jax
+import jax.flatten_util
 import numpy as np
 
 jax.config.update("jax_enable_x64", True)
@@ -9,7 +10,7 @@ import h5py as h5
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from karmma import KarmmaConfig, KarmmaSampler
-from karmma.structs import KarmmaPosition, ThetaParams, XlmParams
+from karmma.structs import KarmmaPosition, ThetaParams, WhitenedKarmmaPosition, XlmParams
 
 # Bayesian pseudo-count controlling how much the initial_imm seed persists
 # across warmup windows in blackjax's window_adaptation (requires the
@@ -48,8 +49,13 @@ if io.initial_position.xlm is None:
 else:
     initial_position = io.initial_position
 
-print("Computing initial IMM (Schur+CG diagonal estimate) at the initial position ...")
-initial_imm = sampler.initialize_imm(initial_position)
+print("Computing dense theta covariance (Schur+CG) for eigenbasis reparametrization ...")
+dense_theta_matrix = sampler.dense_theta_imm(initial_position)
+sampler.build_theta_reparam(dense_theta_matrix, initial_position.theta)
+sampling_position = WhitenedKarmmaPosition(
+    xlm=initial_position.xlm, phi=sampler.theta_to_phi(initial_position.theta)
+)
+initial_imm = np.ones(jax.flatten_util.ravel_pytree(initial_position)[0].shape[0])
 
 states, infos, mcmc_parameters, winfo = sampler.sample(
     key=mcmc.key,
@@ -57,7 +63,7 @@ states, infos, mcmc_parameters, winfo = sampler.sample(
     num_samples=mcmc.n_samples,
     step_size=mcmc.step_size,
     target_acceptance_rate=mcmc.target_acceptance,
-    initial_position=initial_position,
+    initial_position=sampling_position,
     initial_imm=initial_imm,
     imm_shrinkage_to_previous=IMM_SHRINKAGE_TO_PREVIOUS,
 )
@@ -95,6 +101,15 @@ with h5.File(os.path.join(io.io_dir, "mcmc_metadata.h5"), "w") as f:
     # initial IMM provenance
     f["initial_imm"] = np.array(initial_imm)
     f["imm_shrinkage_to_previous"] = np.array(IMM_SHRINKAGE_TO_PREVIOUS)
+
+    # theta eigenbasis whitening transform (needed to interpret the
+    # phi-space theta block of inverse_mass_matrix above)
+    reparam_grp = f.create_group("theta_reparam")
+    reparam_grp.create_dataset("V", data=np.array(sampler.V))
+    reparam_grp.create_dataset("w", data=np.array(sampler.w))
+    theta0_grp = reparam_grp.create_group("theta0")
+    for field in ThetaParams._fields:
+        theta0_grp.create_dataset(field, data=np.array(getattr(sampler.theta0, field)))
 
     f["log_prob"] = np.array(infos.logdensity)
 
