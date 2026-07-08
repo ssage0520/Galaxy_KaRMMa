@@ -1,6 +1,12 @@
 from .config import KarmmaConfig
 from .karmma import KarmmaSampler
-from .structs import KarmmaPosition, MCLMCInfo, ThetaParams, XlmParams
+from .structs import (
+    KarmmaPosition,
+    MCLMCInfo,
+    ThetaParams,
+    WhitenedKarmmaPosition,
+    XlmParams,
+)
 
 __all__ = [
     "KarmmaConfig",
@@ -8,5 +14,6 @@ __all__ = [
     "KarmmaPosition",
     "MCLMCInfo",
     "ThetaParams",
+    "WhitenedKarmmaPosition",
     "XlmParams",
 ]

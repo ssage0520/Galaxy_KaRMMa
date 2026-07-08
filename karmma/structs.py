@@ -22,6 +22,11 @@ class KarmmaPosition(NamedTuple):
     theta: ThetaParams | None = None
 
 
+class WhitenedKarmmaPosition(NamedTuple):
+    xlm: XlmParams
+    phi: jnp.ndarray  # (n_theta,) flat whitened bias parameters
+
+
 class MCLMCInfo(NamedTuple):
     logdensity: jnp.ndarray
     energy_change: jnp.ndarray
