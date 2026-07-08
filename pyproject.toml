@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "karmma"
+version = "0.0.1"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+
+[tool.setuptools.packages.find]
+include = ["karmma*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+  "B",    # bugbear: bug-prone patterns (mutable defaults, loop-var closures, bad except)
+          # e.g. def f(x=[]):  ->  def f(x=None):
+  "C4",   # comprehensions: unnecessary/inefficient comprehensions and literals
+          # e.g. list(x for x in y)  ->  [x for x in y]
+  "E7",   # pycodestyle statements: ==None/True, bare except, lambda assignment
+          # e.g. if x == None:  ->  if x is None:
+  "F",    # pyflakes: unused imports/vars, undefined names, bad string formatting
+          # e.g. import os  (unused)  ->  removed
+  "I001", # isort: import sorting and grouping
+          # e.g. import sys; import os  ->  import os; import sys
+  "NPY",  # NumPy-specific: deprecated aliases, legacy np.random API, NumPy 2.0 removals
+          # e.g. np.random.seed(0)  ->  np.random.default_rng(0)
+  "PERF", # Perflint: needlessly slow patterns, e.g. manual list-copy loops
+          # e.g. for x in y: out.append(x)  ->  out = list(y)
+  "SIM",  # flake8-simplify: code that could be written more simply
+          # e.g. if x: y = 1 else: y = 2  ->  y = 1 if x else 2
+  "UP",   # pyupgrade: modernize syntax for the target Python version
+          # e.g. Optional[int]  ->  int | None
+  "W605", # invalid escape sequences in non-raw strings
+          # e.g. "\d+"  ->  r"\d+"
+]
+
+# TODO: when doing a dedicated docs/annotations cleanup pass, add ANN
+# (flake8-annotations) and D (pydocstyle). For D convention-fixes only,
+# without requiring docstrings to be added everywhere: ignore = ["D1"].
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+nested-string-quote-style = "alternating"
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
+preview = false
