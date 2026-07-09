@@ -19,10 +19,14 @@ line-length = 88
 
 [tool.ruff.lint]
 select = [
+  "ANN",  # flake8-annotations: missing type annotations on args/returns
+          # e.g. def f(x): -> def f(x: int) -> int:
   "B",    # bugbear: bug-prone patterns (mutable defaults, loop-var closures, bad except)
           # e.g. def f(x=[]):  ->  def f(x=None):
   "C4",   # comprehensions: unnecessary/inefficient comprehensions and literals
           # e.g. list(x for x in y)  ->  [x for x in y]
+  "D",    # pydocstyle: missing/malformed docstrings (numpy convention, see below)
+          # e.g. def f(x): """f""" -> def f(x): """Do a thing."""
   "E7",   # pycodestyle statements: ==None/True, bare except, lambda assignment
           # e.g. if x == None:  ->  if x is None:
   "F",    # pyflakes: unused imports/vars, undefined names, bad string formatting
@@ -40,10 +44,11 @@ select = [
   "W605", # invalid escape sequences in non-raw strings
           # e.g. "\d+"  ->  r"\d+"
 ]
+# numpy convention ignores D417 (undocumented param) by default; we want it back.
+extend-select = ["D417"]
 
-# TODO: when doing a dedicated docs/annotations cleanup pass, add ANN
-# (flake8-annotations) and D (pydocstyle). For D convention-fixes only,
-# without requiring docstrings to be added everywhere: ignore = ["D1"].
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
 
 [tool.ruff.format]
 quote-style = "double"
