@@ -321,7 +321,7 @@ class KarmmaSampler:
 
         S = 0.5 * (precision_bb + precision_bb.T)
         w, U = jnp.linalg.eigh(S)
-        w_fixed = jnp.clip(jnp.abs(w), a_min=float(jnp.max(jnp.abs(w))) / kappa_max)
+        w_fixed = jnp.clip(jnp.abs(w), min=float(jnp.max(jnp.abs(w))) / kappa_max)
 
         return np.array((U / w_fixed) @ U.T)
 
@@ -436,16 +436,19 @@ class KarmmaSampler:
             imm_shrinkage_to_previous=imm_shrinkage_to_previous,
             target_acceptance_rate=target_acceptance_rate,
             is_mass_matrix_diagonal=True,
-            progress_bar=True,
             adaptation_info_fn=filter_fn,
         )
         key, warmup_key = jax.random.split(key)
         print()
-        (wstate, parameters), winfo = warmup.run(
-            warmup_key, initial_position, num_steps=num_warmup
-        )
+        with blackjax.progress_bar(label="Warmup (window adaptation)"):
+            (wstate, parameters), winfo = warmup.run(
+                warmup_key, initial_position, num_steps=num_warmup
+            )
+            # Forces real synchronization before the with-block exits — otherwise
+            # JAX's async dispatch lets this return (and the progress bar close,
+            # stamped at 100%) long before the warmup scan has actually finished.
+            jax.block_until_ready((wstate, parameters))
 
-        wstate.position.xlm.real.block_until_ready()
         t1 = time.perf_counter()
         print()
 
@@ -472,24 +475,25 @@ class KarmmaSampler:
 
         key, sample_key = jax.random.split(key)
         print()
-        _, (states, infos) = blackjax.util.run_inference_algorithm(
-            rng_key=sample_key,
-            inference_algorithm=nuts,
-            num_steps=num_samples,
-            initial_state=wstate,
-            progress_bar=True,
-            transform=lambda state, info: (
-                state.position,
-                NUTSInfo(
-                    is_divergent=info.is_divergent,
-                    num_integration_steps=info.num_integration_steps,
-                    acceptance_rate=info.acceptance_rate,
-                    energy=info.energy,
-                    logdensity=state.logdensity,
+        with blackjax.progress_bar(label="Sampling"):
+            _, (states, infos) = blackjax.util.run_inference_algorithm(
+                rng_key=sample_key,
+                inference_algorithm=nuts,
+                num_steps=num_samples,
+                initial_state=wstate,
+                transform=lambda state, info: (
+                    state.position,
+                    NUTSInfo(
+                        is_divergent=info.is_divergent,
+                        num_integration_steps=info.num_integration_steps,
+                        acceptance_rate=info.acceptance_rate,
+                        energy=info.energy,
+                        logdensity=state.logdensity,
+                    ),
                 ),
-            ),
-        )
-        states.xlm.real.block_until_ready()
+            )
+            jax.block_until_ready((states, infos))
+
         t2 = time.perf_counter()
         print()
 
