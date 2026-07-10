@@ -473,6 +473,10 @@ class KarmmaSampler:
                 params=initial_params,
                 l_factor=l_factor,
             )
+            # Forces real synchronization before the with-block exits — otherwise
+            # JAX's async dispatch lets this return (and the progress bar close,
+            # stamped at 100%) long before the tuning scan has actually finished.
+            jax.block_until_ready((state_12, params_12))
 
         imm_12 = np.array(params_12.inverse_mass_matrix)
         step_size_12_finite = bool(np.isfinite(params_12.step_size))
@@ -517,8 +521,9 @@ class KarmmaSampler:
                 params=params_12,
                 l_factor=l_factor * thinning_warmup,
             )
+            # See the analogous comment on Call 1 — same reason.
+            jax.block_until_ready((tuned_state, tuned_params))
 
-        tuned_state.position.xlm.real.block_until_ready()
         t1 = time.perf_counter()
         print()
 
@@ -590,7 +595,9 @@ class KarmmaSampler:
                     ),
                 ),
             )
-        states.xlm.real.block_until_ready()
+            # See the analogous comment on Call 1 — same reason.
+            jax.block_until_ready((states, infos))
+
         t2 = time.perf_counter()
         print()
 
