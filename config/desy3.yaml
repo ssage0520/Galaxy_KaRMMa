@@ -17,9 +17,9 @@ mcmc:
     seed: null
     n_samples: 1500
     frac_tune1: 0.1
-    frac_tune2: 0.3
+    frac_tune2: 0.1
     frac_tune3: 0.1
     l_factor: 0.4
-    thinning_warmup: 4
-    thinning_sampling: 50
+    thinning_warmup: 5
+    thinning_sampling: 30
     desired_energy_var: 0.0005
