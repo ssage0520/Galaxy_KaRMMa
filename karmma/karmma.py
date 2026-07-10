@@ -327,7 +327,7 @@ class KarmmaSampler:
 
         S = 0.5 * (precision_bb + precision_bb.T)
         w, U = jnp.linalg.eigh(S)
-        w_fixed = jnp.clip(jnp.abs(w), a_min=float(jnp.max(jnp.abs(w))) / kappa_max)
+        w_fixed = jnp.clip(jnp.abs(w), min=float(jnp.max(jnp.abs(w))) / kappa_max)
 
         return np.array((U / w_fixed) @ U.T)
 
@@ -577,7 +577,6 @@ class KarmmaSampler:
             inference_algorithm=thinned_sampling_alg,
             num_steps=num_samples,
             initial_state=tuned_state,
-            progress_bar=True,
             transform=lambda state, info: (
                 state.position,
                 MCLMCInfo(
