@@ -456,22 +456,23 @@ class KarmmaSampler:
         # Call 1: phases 1+2 only, always unthinned — raw kernel, since
         # thinning=1 needs no thin_kernel wrapper.
         print()
-        state_12, params_12, warmup_calls_12 = blackjax.mclmc_find_L_and_step_size(
-            mclmc_kernel=blackjax.mcmc.mclmc.build_kernel(
-                integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
-            ),
-            logdensity_fn=log_prob,
-            num_steps=round(num_samples * thinning_sampling),
-            state=init_state,
-            rng_key=key_warmup1,
-            diagonal_preconditioning=True,
-            frac_tune1=frac_tune1,
-            frac_tune2=frac_tune2,
-            frac_tune3=0.0,
-            desired_energy_var=desired_energy_var,
-            params=initial_params,
-            l_factor=l_factor,
-        )
+        with blackjax.progress_bar(label="Phases 1+2 (step size + IMM)"):
+            state_12, params_12, warmup_calls_12 = blackjax.mclmc_find_L_and_step_size(
+                mclmc_kernel=blackjax.mcmc.mclmc.build_kernel(
+                    integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
+                ),
+                logdensity_fn=log_prob,
+                num_steps=round(num_samples * thinning_sampling),
+                state=init_state,
+                rng_key=key_warmup1,
+                diagonal_preconditioning=True,
+                frac_tune1=frac_tune1,
+                frac_tune2=frac_tune2,
+                frac_tune3=0.0,
+                desired_energy_var=desired_energy_var,
+                params=initial_params,
+                l_factor=l_factor,
+            )
 
         imm_12 = np.array(params_12.inverse_mass_matrix)
         step_size_12_finite = bool(np.isfinite(params_12.step_size))
@@ -495,26 +496,27 @@ class KarmmaSampler:
         # Call 2: phase 3 only, thinned by thinning_warmup, seeded from
         # call 1's state/params so it continues the tuned chain.
         print()
-        tuned_state, tuned_params, warmup_calls_3 = blackjax.mclmc_find_L_and_step_size(
-            mclmc_kernel=blackjax.util.thin_kernel(
-                blackjax.mcmc.mclmc.build_kernel(
-                    integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
+        with blackjax.progress_bar(label="Phase 3 (L via ESS)"):
+            tuned_state, tuned_params, warmup_calls_3 = blackjax.mclmc_find_L_and_step_size(
+                mclmc_kernel=blackjax.util.thin_kernel(
+                    blackjax.mcmc.mclmc.build_kernel(
+                        integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
+                    ),
+                    thinning=thinning_warmup,
+                    info_transform=rms_info,
                 ),
-                thinning=thinning_warmup,
-                info_transform=rms_info,
-            ),
-            logdensity_fn=log_prob,
-            num_steps=round(num_samples * thinning_sampling / thinning_warmup),
-            state=state_12,
-            rng_key=key_warmup2,
-            diagonal_preconditioning=True,
-            frac_tune1=0.0,
-            frac_tune2=0.0,
-            frac_tune3=frac_tune3,
-            desired_energy_var=desired_energy_var,
-            params=params_12,
-            l_factor=l_factor * thinning_warmup,
-        )
+                logdensity_fn=log_prob,
+                num_steps=round(num_samples * thinning_sampling / thinning_warmup),
+                state=state_12,
+                rng_key=key_warmup2,
+                diagonal_preconditioning=True,
+                frac_tune1=0.0,
+                frac_tune2=0.0,
+                frac_tune3=frac_tune3,
+                desired_energy_var=desired_energy_var,
+                params=params_12,
+                l_factor=l_factor * thinning_warmup,
+            )
 
         tuned_state.position.xlm.real.block_until_ready()
         t1 = time.perf_counter()
@@ -572,21 +574,22 @@ class KarmmaSampler:
         )
 
         print()
-        _, (states, infos) = blackjax.util.run_inference_algorithm(
-            rng_key=key_sample,
-            inference_algorithm=thinned_sampling_alg,
-            num_steps=num_samples,
-            initial_state=tuned_state,
-            transform=lambda state, info: (
-                state.position,
-                MCLMCInfo(
-                    logdensity=info.logdensity,
-                    energy_change=info.energy_change,
-                    kinetic_change=info.kinetic_change,
-                    nonans=info.nonans,
+        with blackjax.progress_bar(label="Sampling"):
+            _, (states, infos) = blackjax.util.run_inference_algorithm(
+                rng_key=key_sample,
+                inference_algorithm=thinned_sampling_alg,
+                num_steps=num_samples,
+                initial_state=tuned_state,
+                transform=lambda state, info: (
+                    state.position,
+                    MCLMCInfo(
+                        logdensity=info.logdensity,
+                        energy_change=info.energy_change,
+                        kinetic_change=info.kinetic_change,
+                        nonans=info.nonans,
+                    ),
                 ),
-            ),
-        )
+            )
         states.xlm.real.block_until_ready()
         t2 = time.perf_counter()
         print()
