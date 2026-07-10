@@ -15,7 +15,7 @@ dependencies:
   - h5py=3.16.0
   - numpy=2.5.1
   - scipy=1.18.0
-  - matplotlib=3.11.0
+  - matplotlib=3.10.8  # 3.11.0's new text engine needs libraqm, which needs glibc>=2.28 — too new for this HPC's OS
   - astropy=8.0.1
   - pandas=3.0.3
   - pyyaml=6.0.3
