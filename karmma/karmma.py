@@ -436,8 +436,24 @@ class KarmmaSampler:
 
         key, key_init, key_warmup1, key_warmup2, key_sample = jax.random.split(key, 5)
 
-        def rms_info(info):
-            return jax.tree.map(lambda x: (x**2).mean() ** 0.5, info)
+        def sample_info(info):
+            """Aggregates raw per-step MCLMC info over a thinning block.
+
+            logdensity takes the last raw step's value — exactly matching
+            the block's final (saved) position — rather than an aggregate;
+            energy_change/kinetic_change are genuinely mean-zero step-error
+            diagnostics where an RMS magnitude is meaningful, but RMS-ing
+            logdensity (uniformly large-magnitude and negative) collapses to
+            |logdensity|, silently flipping its sign. nonans is a 0/1
+            indicator, so it needs a mean (fraction clean), not RMS — RMS of
+            a 0/1 array is sqrt(fraction), not the fraction itself.
+            """
+            return info._replace(
+                logdensity=info.logdensity[-1],
+                energy_change=(info.energy_change**2).mean() ** 0.5,
+                kinetic_change=(info.kinetic_change**2).mean() ** 0.5,
+                nonans=info.nonans.mean(),
+            )
 
         init_state = blackjax.mcmc.mclmc.init(
             position=initial_position, logdensity_fn=log_prob, rng_key=key_init
@@ -507,7 +523,7 @@ class KarmmaSampler:
                         integrator=blackjax.mcmc.integrators.isokinetic_mclachlan,
                     ),
                     thinning=thinning_warmup,
-                    info_transform=rms_info,
+                    info_transform=sample_info,
                 ),
                 logdensity_fn=log_prob,
                 num_steps=round(num_samples * thinning_sampling / thinning_warmup),
@@ -575,7 +591,7 @@ class KarmmaSampler:
             inverse_mass_matrix=tuned_params.inverse_mass_matrix,
         )
         thinned_sampling_alg = blackjax.util.thin_algorithm(
-            mclmc_sampler, thinning=thinning_sampling, info_transform=rms_info
+            mclmc_sampler, thinning=thinning_sampling, info_transform=sample_info
         )
 
         print()
