@@ -25,6 +25,7 @@ dependencies:
   - tqdm=4.68.4
   - joblib=1.5.3
   - ruff=0.15.21
+  - nbstripout=0.9.1
   - pip
   - pip:
       # Required for blackjax.progress_bar(); not on conda-forge.
