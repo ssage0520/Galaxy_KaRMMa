@@ -25,9 +25,7 @@ NUTS_ONLY_KEYS = (
 MCLMC_ONLY_KEYS = (
     "L",
     "energy_change",
-    "kinetic_change",
     "nonans",
-    "warmup_calls",
     "thinning_warmup",
     "thinning_sampling",
 )
@@ -56,7 +54,7 @@ def load_run(output_dir, mock_dg_path, label, color):
     """Loads one output directory into a run dict for the metadata notebook.
 
     Keys present regardless of sampler type: label, color, output_dir, type,
-    seed, step_size, inverse_mass_matrix, initial_imm, log_prob,
+    seed, step_size, inverse_mass_matrix, log_prob,
     theta_reparam, xlm_real, xlm_imag, theta_samples, nbins, n_real, n_imag,
     n_samples, true_theta, ess_xlm_real, ess_xlm_imag, ess_theta.
     `extra` holds whatever's specific to the detected type (NUTS_ONLY_KEYS or
@@ -78,7 +76,6 @@ def load_run(output_dir, mock_dg_path, label, color):
         seed = f["seed"][()]
         step_size = f["step_size"][()]
         inverse_mass_matrix = f["inverse_mass_matrix"][:]
-        initial_imm = f["initial_imm"][:]
         log_prob = f["log_prob"][:]
         theta_reparam = {
             "V": f["theta_reparam/V"][:],
@@ -111,7 +108,6 @@ def load_run(output_dir, mock_dg_path, label, color):
         "seed": seed,
         "step_size": step_size,
         "inverse_mass_matrix": inverse_mass_matrix,
-        "initial_imm": initial_imm,
         "log_prob": log_prob,
         "theta_reparam": theta_reparam,
         "xlm_real": xlm_real,

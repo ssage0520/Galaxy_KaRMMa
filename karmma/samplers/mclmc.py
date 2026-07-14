@@ -242,7 +242,6 @@ class MCLMCSampler(WhitenedSampler):
                     MCLMCInfo(
                         logdensity=info.logdensity,
                         energy_change=info.energy_change,
-                        kinetic_change=info.kinetic_change,
                         nonans=info.nonans,
                     ),
                 ),
@@ -267,4 +266,4 @@ class MCLMCSampler(WhitenedSampler):
         theta = jax.vmap(self.phi_to_theta)(states.phi)
         states = KarmmaPosition(xlm=states.xlm, theta=theta)
 
-        return states, infos, tuned_params, warmup_calls
+        return states, infos, tuned_params

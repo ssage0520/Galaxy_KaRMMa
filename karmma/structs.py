@@ -30,7 +30,6 @@ class WhitenedKarmmaPosition(NamedTuple):
 class MCLMCInfo(NamedTuple):
     logdensity: jnp.ndarray
     energy_change: jnp.ndarray
-    kinetic_change: jnp.ndarray
     nonans: jnp.ndarray
 
 

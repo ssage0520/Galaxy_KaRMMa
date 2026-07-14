@@ -52,7 +52,7 @@ else:
 initial_imm = np.ones(jax.flatten_util.ravel_pytree(initial_position)[0].shape[0])
 
 sampler = MCLMCSampler(model)
-states, infos, tuned_params, warmup_calls = sampler.sample(
+states, infos, tuned_params = sampler.sample(
     key=mcmc.key,
     num_samples=mcmc.n_samples,
     initial_position=initial_position,
@@ -88,15 +88,12 @@ with h5.File(os.path.join(io.io_dir, "mcmc_metadata.h5"), "w") as f:
 
     # sampling diagnostics (RMS-aggregated over each block of `thinning_sampling` raw steps)
     f["energy_change"] = np.array(infos.energy_change)
-    f["kinetic_change"] = np.array(infos.kinetic_change)
     f["nonans"] = np.array(infos.nonans)
     f["log_prob"] = np.array(infos.logdensity)
 
     # warmup provenance
-    f["warmup_calls"] = np.array(warmup_calls)
     f["thinning_warmup"] = np.array(mcmc.thinning_warmup)
     f["thinning_sampling"] = np.array(mcmc.thinning_sampling)
-    f["initial_imm"] = np.array(initial_imm)
 
     # theta eigenbasis whitening transform (needed to interpret the
     # phi-space theta block of inverse_mass_matrix above)
