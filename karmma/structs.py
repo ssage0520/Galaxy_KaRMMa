@@ -41,7 +41,18 @@ class NUTSInfo(NamedTuple):
     logdensity: jnp.ndarray
 
 
-class McmcConfig(NamedTuple):
+class NutsConfig(NamedTuple):
+    n_samples: int
+    key: Any
+    seed: int
+    num_warmup: int
+    step_size: float
+    target_acceptance_rate: float
+    imm_shrinkage_to_previous: float
+    infer_theta: bool
+
+
+class MclmcConfig(NamedTuple):
     n_samples: int
     key: Any
     seed: int

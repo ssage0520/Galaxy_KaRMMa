@@ -8,7 +8,8 @@ from karmma.structs import (
     AnalysisConfig,
     IoConfig,
     KarmmaPosition,
-    McmcConfig,
+    MclmcConfig,
+    NutsConfig,
     ThetaParams,
     XlmParams,
 )
@@ -125,30 +126,74 @@ class KarmmaConfig:
             theta_fixed=theta_fixed,
         )
 
-    def _set_mcmc(self, cfg):
-        n_samples = int(cfg["n_samples"])
-
+    def _resolve_seed_and_key(self, cfg):
         seed = cfg.get("seed")
         if seed is None:
             seed = int(np.random.default_rng().integers(0, 2**31))
             print(f"No seed provided — using randomly generated seed: {seed}")
         else:
             seed = int(seed)
-        key = jax.random.PRNGKey(seed)
+        return seed, jax.random.PRNGKey(seed)
 
-        frac_tune1 = float(cfg.get("frac_tune1", 0.1))
-        # 0.3, not blackjax's stock 0.1 — validated in dev_notebooks/mclmc.ipynb
-        # to give diagonal preconditioning enough samples to converge.
-        frac_tune2 = float(cfg.get("frac_tune2", 0.3))
-        frac_tune3 = float(cfg.get("frac_tune3", 0.1))
-        l_factor = float(cfg.get("l_factor", 0.4))
-        thinning_warmup = int(cfg.get("thinning_warmup", 5))
-        thinning_sampling = int(cfg.get("thinning_sampling", 5))
-        desired_energy_var = float(cfg.get("desired_energy_var", 5e-4))
+    def _get_or_default(self, cfg, key, default, cast=float):
+        # `cfg.get(key, default)` only falls back when `key` is absent, not when
+        # it's present with an explicit YAML `null` (e.g. config/nuts.yaml's
+        # `target_acceptance_rate: null`) — this treats both cases the same.
+        value = cfg.get(key)
+        return default if value is None else cast(value)
+
+    def _set_mcmc(self, cfg):
+        # Named `sampler_backend`, not `sampler` — `sampler` is reserved elsewhere
+        # (e.g. run_karmma.py's dispatch) for the actual constructed sampler
+        # *object*; this is just the dispatch string read from the config.
+        sampler_backend = cfg.get("sampler", "mclmc")
+        if sampler_backend == "nuts":
+            return self._set_nuts(cfg)
+        if sampler_backend == "mclmc":
+            return self._set_mclmc(cfg)
+        raise ValueError(
+            f"Unknown mcmc.sampler {sampler_backend!r}; expected 'nuts' or 'mclmc'."
+        )
+
+    def _set_nuts(self, cfg):
+        n_samples = int(cfg["n_samples"])
+        seed, key = self._resolve_seed_and_key(cfg)
+
+        num_warmup = int(cfg["num_warmup"])
+        step_size = self._get_or_default(cfg, "step_size", 0.05)
+        target_acceptance_rate = self._get_or_default(cfg, "target_acceptance_rate", 0.65)
+        imm_shrinkage_to_previous = self._get_or_default(cfg, "imm_shrinkage_to_previous", 0.0)
 
         infer_theta = bool(cfg.get("infer_theta", False))
 
-        return McmcConfig(
+        return NutsConfig(
+            n_samples=n_samples,
+            key=key,
+            seed=seed,
+            num_warmup=num_warmup,
+            step_size=step_size,
+            target_acceptance_rate=target_acceptance_rate,
+            imm_shrinkage_to_previous=imm_shrinkage_to_previous,
+            infer_theta=infer_theta,
+        )
+
+    def _set_mclmc(self, cfg):
+        n_samples = int(cfg["n_samples"])
+        seed, key = self._resolve_seed_and_key(cfg)
+
+        frac_tune1 = self._get_or_default(cfg, "frac_tune1", 0.1)
+        # 0.3, not blackjax's stock 0.1 — validated in dev_notebooks/mclmc.ipynb
+        # to give diagonal preconditioning enough samples to converge.
+        frac_tune2 = self._get_or_default(cfg, "frac_tune2", 0.3)
+        frac_tune3 = self._get_or_default(cfg, "frac_tune3", 0.1)
+        l_factor = self._get_or_default(cfg, "l_factor", 0.4)
+        thinning_warmup = self._get_or_default(cfg, "thinning_warmup", 5, cast=int)
+        thinning_sampling = self._get_or_default(cfg, "thinning_sampling", 5, cast=int)
+        desired_energy_var = self._get_or_default(cfg, "desired_energy_var", 5e-4)
+
+        infer_theta = bool(cfg.get("infer_theta", False))
+
+        return MclmcConfig(
             n_samples=n_samples,
             key=key,
             seed=seed,
