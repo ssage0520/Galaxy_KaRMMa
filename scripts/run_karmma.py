@@ -10,10 +10,10 @@ import h5py as h5
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from karmma import ForwardModel, KarmmaConfig
+from karmma.samplers.mclmc import MCLMCSampler
 from karmma.structs import (
     KarmmaPosition,
     ThetaParams,
-    WhitenedKarmmaPosition,
     XlmParams,
 )
 
@@ -24,7 +24,7 @@ analysis = config.analysis
 io = config.io
 mcmc = config.mcmc
 
-sampler = ForwardModel(
+model = ForwardModel(
     dg_obs=io.dg_obs,
     N_bar=io.N_bar,
     mask=io.mask,
@@ -37,32 +37,25 @@ sampler = ForwardModel(
 )
 
 print(
-    f"Sampler initialized (nside={sampler.Nside}, nbins={sampler.Nbins}, n_modes={sampler.n_modes}, infer_theta={mcmc.infer_theta})."
+    f"Model initialized (nside={model.Nside}, nbins={model.Nbins}, n_modes={model.n_modes}, infer_theta={mcmc.infer_theta})."
 )
 
-# resolve random xlm init now that sampler shape info is available
+# resolve random xlm init now that model shape info is available
 if io.initial_position.xlm is None:
     key, init_key = jax.random.split(mcmc.key)
-    xlm_full = sampler.make_random_xlm(init_key)
+    xlm_full = model.make_random_xlm(init_key)
     xlm = XlmParams(real=0.3 * xlm_full.real, imag=0.3 * xlm_full.imag)
     initial_position = KarmmaPosition(xlm=xlm, theta=io.initial_position.theta)
 else:
     initial_position = io.initial_position
 
-print(
-    "Computing dense theta covariance (Schur+CG) for eigenbasis reparametrization ..."
-)
-dense_theta_matrix = sampler.dense_theta_imm(initial_position)
-sampler.build_theta_reparam(dense_theta_matrix, initial_position.theta)
-sampling_position = WhitenedKarmmaPosition(
-    xlm=initial_position.xlm, phi=sampler.theta_to_phi(initial_position.theta)
-)
-initial_imm = np.ones(jax.flatten_util.ravel_pytree(sampling_position)[0].shape[0])
+initial_imm = np.ones(jax.flatten_util.ravel_pytree(initial_position)[0].shape[0])
 
+sampler = MCLMCSampler(model)
 states, infos, tuned_params, warmup_calls = sampler.sample(
     key=mcmc.key,
     num_samples=mcmc.n_samples,
-    initial_position=sampling_position,
+    initial_position=initial_position,
     initial_imm=initial_imm,
     frac_tune1=mcmc.frac_tune1,
     frac_tune2=mcmc.frac_tune2,
