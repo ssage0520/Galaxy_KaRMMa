@@ -33,6 +33,14 @@ class MCLMCInfo(NamedTuple):
     nonans: jnp.ndarray
 
 
+class NUTSInfo(NamedTuple):
+    is_divergent: jnp.ndarray
+    num_integration_steps: jnp.ndarray
+    acceptance_rate: jnp.ndarray
+    energy: jnp.ndarray
+    logdensity: jnp.ndarray
+
+
 class McmcConfig(NamedTuple):
     n_samples: int
     key: Any

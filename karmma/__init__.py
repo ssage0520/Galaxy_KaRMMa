@@ -3,6 +3,7 @@ from .forward_model import ForwardModel
 from .structs import (
     KarmmaPosition,
     MCLMCInfo,
+    NUTSInfo,
     ThetaParams,
     WhitenedKarmmaPosition,
     XlmParams,
@@ -13,6 +14,7 @@ __all__ = [
     "ForwardModel",
     "KarmmaPosition",
     "MCLMCInfo",
+    "NUTSInfo",
     "ThetaParams",
     "WhitenedKarmmaPosition",
     "XlmParams",
