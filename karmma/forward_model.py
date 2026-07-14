@@ -27,7 +27,7 @@ _INVGAMMA_ALPHA_R = 1.0  # TODO: expose in McmcConfig
 _INVGAMMA_BETA_R = (5.0 / 8.0) ** 2.0  # TODO: expose in McmcConfig
 
 
-class KarmmaSampler:
+class ForwardModel:
     def __init__(
         self,
         dg_obs,
