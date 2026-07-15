@@ -144,4 +144,4 @@ class NUTSSampler(WhitenedSampler):
         theta = jax.vmap(self.phi_to_theta)(states.phi)
         states = KarmmaPosition(xlm=states.xlm, theta=theta)
 
-        return states, infos, tuned_params
+        return states, infos, tuned_params, winfo
