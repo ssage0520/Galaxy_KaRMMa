@@ -9,7 +9,7 @@ import numpy as np
 from blackjax.adaptation.mclmc_adaptation import MCLMCAdaptationState
 
 from karmma.samplers.base import WhitenedSampler
-from karmma.structs import KarmmaPosition, MCLMCInfo, WhitenedKarmmaPosition
+from karmma.structs import KarmmaPosition, MCLMCInfo
 
 
 class MCLMCSampler(WhitenedSampler):
@@ -54,18 +54,7 @@ class MCLMCSampler(WhitenedSampler):
         `init_state`/`initial_params`) so phase 3 continues the chain instead
         of restarting cold.
         """
-        self._build_reparam(initial_position)
-        sampling_position = WhitenedKarmmaPosition(
-            xlm=initial_position.xlm, phi=self.theta_to_phi(initial_position.theta)
-        )
-
-        def log_prob(params: WhitenedKarmmaPosition):
-            theta = self.phi_to_theta(params.phi)
-            return self.model.log_prob(KarmmaPosition(xlm=params.xlm, theta=theta))
-
-        # jax.jit matters here since mclmc.init isn't itself jit-decorated;
-        # elsewhere the enclosing lax.scan compiles everything regardless.
-        log_prob = jax.jit(log_prob)
+        sampling_position, log_prob = self._prepare_sampling(initial_position)
         dim = blackjax.util.pytree_size(sampling_position)
 
         t0 = time.perf_counter()
@@ -263,7 +252,6 @@ class MCLMCSampler(WhitenedSampler):
         )
         print(f"Fraction of non-NaN steps: {np.array(infos.nonans).mean():.4f}")
 
-        theta = jax.vmap(self.phi_to_theta)(states.phi)
-        states = KarmmaPosition(xlm=states.xlm, theta=theta)
+        states = self._unwhiten(states)
 
         return states, infos, tuned_params

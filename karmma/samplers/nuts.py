@@ -8,7 +8,7 @@ import numpy as np
 from blackjax.adaptation.base import get_filter_adapt_info_fn
 
 from karmma.samplers.base import WhitenedSampler
-from karmma.structs import KarmmaPosition, NUTSInfo, WhitenedKarmmaPosition
+from karmma.structs import KarmmaPosition, NUTSInfo
 
 
 class NUTSSampler(WhitenedSampler):
@@ -46,16 +46,7 @@ class NUTSSampler(WhitenedSampler):
         no constant (the phi -> theta map is linear with a phi-independent
         Jacobian, which doesn't affect NUTS/HMC dynamics or acceptance).
         """
-        self._build_reparam(initial_position)
-        sampling_position = WhitenedKarmmaPosition(
-            xlm=initial_position.xlm, phi=self.theta_to_phi(initial_position.theta)
-        )
-
-        def log_prob(params: WhitenedKarmmaPosition):
-            theta = self.phi_to_theta(params.phi)
-            return self.model.log_prob(KarmmaPosition(xlm=params.xlm, theta=theta))
-
-        log_prob = jax.jit(log_prob)
+        sampling_position, log_prob = self._prepare_sampling(initial_position)
 
         t0 = time.perf_counter()
 
@@ -141,7 +132,6 @@ class NUTSSampler(WhitenedSampler):
         print(f"Mean acceptance rate: {jnp.mean(infos.acceptance_rate):.4f}")
         print(f"Number of divergences: {jnp.sum(infos.is_divergent)}")
 
-        theta = jax.vmap(self.phi_to_theta)(states.phi)
-        states = KarmmaPosition(xlm=states.xlm, theta=theta)
+        states = self._unwhiten(states)
 
         return states, infos, tuned_params, winfo

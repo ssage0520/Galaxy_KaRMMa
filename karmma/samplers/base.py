@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.scipy.sparse.linalg import cg
 
-from karmma.structs import KarmmaPosition, ThetaParams
+from karmma.structs import KarmmaPosition, ThetaParams, WhitenedKarmmaPosition
 
 
 class WhitenedSampler:
@@ -137,3 +137,28 @@ class WhitenedSampler:
         theta0_flat, unravel = jax.flatten_util.ravel_pytree(self.theta0)
         theta_flat = theta0_flat + self.V @ (phi * jnp.sqrt(self.w))
         return unravel(theta_flat)
+
+    def _prepare_sampling(self, initial_position: KarmmaPosition):
+        """Whitens `initial_position` (building the reparam as a side effect)
+        and returns the resulting WhitenedKarmmaPosition plus a jitted
+        log_prob wrapper that evaluates self.model.log_prob in phi-space —
+        the setup shared by every sampler backend's sample()."""
+        self._build_reparam(initial_position)
+        sampling_position = WhitenedKarmmaPosition(
+            xlm=initial_position.xlm, phi=self.theta_to_phi(initial_position.theta)
+        )
+
+        def log_prob(params: WhitenedKarmmaPosition):
+            theta = self.phi_to_theta(params.phi)
+            return self.model.log_prob(KarmmaPosition(xlm=params.xlm, theta=theta))
+
+        # Explicit jit matters for callers whose init/warmup entry points
+        # aren't themselves jit-decorated (e.g. MCLMC's mclmc.init); harmless
+        # where the enclosing lax.scan would compile it anyway (e.g. NUTS).
+        return sampling_position, jax.jit(log_prob)
+
+    def _unwhiten(self, states: WhitenedKarmmaPosition) -> KarmmaPosition:
+        """Converts whitened-phi-space sampled states back to a physical
+        (theta-space) KarmmaPosition."""
+        theta = jax.vmap(self.phi_to_theta)(states.phi)
+        return KarmmaPosition(xlm=states.xlm, theta=theta)

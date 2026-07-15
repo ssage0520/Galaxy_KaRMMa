@@ -119,7 +119,7 @@ with h5.File(os.path.join(io.io_dir, "mcmc_metadata.h5"), "w") as f:
         f["warmup_acceptance_rate"] = np.array(winfo.info.acceptance_rate)
         f["warmup_is_divergent"] = np.array(winfo.info.is_divergent)
         f["warmup_num_integration_steps"] = np.array(winfo.info.num_integration_steps)
-    else:
+    elif isinstance(mcmc, MclmcConfig):
         # MCLMCAdaptationState is a NamedTuple
         f["L"] = np.array(tuned_params.L)
         f["step_size"] = np.array(tuned_params.step_size)
@@ -129,6 +129,8 @@ with h5.File(os.path.join(io.io_dir, "mcmc_metadata.h5"), "w") as f:
         f["energy_change"] = np.array(infos.energy_change)
         f["nonans"] = np.array(infos.nonans)
         f["log_prob"] = np.array(infos.logdensity)
+    else:
+        raise ValueError(f"Unrecognized mcmc config type: {type(mcmc).__name__}")
 
     # full mcmc config, for reproducibility
     mcmc_config_grp = f.create_group("mcmc_config")
