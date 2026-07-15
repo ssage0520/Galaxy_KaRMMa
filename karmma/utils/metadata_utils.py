@@ -19,15 +19,12 @@ NUTS_ONLY_KEYS = (
     "warmup_acceptance_rate",
     "warmup_is_divergent",
     "warmup_num_integration_steps",
-    "imm_shrinkage_to_previous",
 )
 
 MCLMC_ONLY_KEYS = (
     "L",
     "energy_change",
     "nonans",
-    "thinning_warmup",
-    "thinning_sampling",
 )
 
 
@@ -50,15 +47,20 @@ def _read_theta_group(f, group):
     return np.stack([f[f"{group}/{field}"][:] for field in THETA_FIELDS], axis=-1)
 
 
+def _read_scalar_or_array(dataset):
+    return dataset[()] if dataset.shape == () else dataset[:]
+
+
 def load_run(output_dir, mock_dg_path, label, color):
     """Loads one output directory into a run dict for the metadata notebook.
 
     Keys present regardless of sampler type: label, color, output_dir, type,
     seed, step_size, inverse_mass_matrix, log_prob,
     theta_reparam, xlm_real, xlm_imag, theta_samples, nbins, n_real, n_imag,
-    n_samples, true_theta, ess_xlm_real, ess_xlm_imag, ess_theta.
+    n_samples, true_theta, ess_xlm_real, ess_xlm_imag, ess_theta, mcmc_config.
     `extra` holds whatever's specific to the detected type (NUTS_ONLY_KEYS or
-    MCLMC_ONLY_KEYS).
+    MCLMC_ONLY_KEYS). `mcmc_config` holds the full mcmc config dump (empty
+    dict for pre-refactor runs that predate that group existing).
     """
     metadata_path = os.path.join(output_dir, "mcmc_metadata.h5")
     samples_path = os.path.join(output_dir, "samples.h5")
@@ -84,10 +86,13 @@ def load_run(output_dir, mock_dg_path, label, color):
         }
         extra_keys = NUTS_ONLY_KEYS if run_type == "nuts" else MCLMC_ONLY_KEYS
         extra = {
-            key: (f[key][()] if f[key].shape == () else f[key][:])
-            for key in extra_keys
-            if key in f
+            key: _read_scalar_or_array(f[key]) for key in extra_keys if key in f
         }
+        mcmc_config = (
+            {key: _read_scalar_or_array(f["mcmc_config"][key]) for key in f["mcmc_config"]}
+            if "mcmc_config" in f
+            else {}
+        )
 
     with h5.File(mock_dg_path, "r") as f:
         true_theta = _read_theta_group(f, "true_theta")  # (nbins, 6)
@@ -122,6 +127,7 @@ def load_run(output_dir, mock_dg_path, label, color):
         "ess_xlm_imag": ess_xlm_imag,
         "ess_theta": ess_theta,
         "extra": extra,
+        "mcmc_config": mcmc_config,
     }
 
 
