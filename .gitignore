@@ -9,6 +9,10 @@ __pycache__/
 # Notebooks used for development only
 dev_notebooks/
 
+# Local run-comparison config for notebooks/metadata.ipynb — see
+# notebooks/metadata_runs.example.yaml for the template.
+notebooks/metadata_runs.yaml
+
 # Any sneaky data files
 *.h5
 *.npy

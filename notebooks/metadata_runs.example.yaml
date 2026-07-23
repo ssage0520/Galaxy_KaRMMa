@@ -1,0 +1,21 @@
+# Template for notebooks/metadata_runs.yaml (gitignored) — copy this file
+# there and edit freely; changes to the copy never show up as notebook diffs.
+#
+# output_dirs:    one Outputs_* directory per run (each must contain samples.h5
+#                 and mcmc_metadata.h5; sampler type is auto-detected per directory).
+# mock_dg_paths:  one mock_dg_*.h5 path per run, matching output_dirs by
+#                 position — only used for the theta truth line in trace plots.
+# run_labels:     optional, one label per run; omit or set to null to
+#                 auto-generate "Run 0", "Run 1", ...
+
+output_dirs:
+  - /spiff/ssage/karmma_data/LN_dg_RS_linmu_bias/Outputs_400
+  - /spiff/ssage/karmma_data/LN_dg_RS_linmu_bias/Outputs_MCLMC
+
+mock_dg_paths:
+  - /spiff/ssage/karmma_data/LN_dg_RS_linmu_bias/Inputs/mock_dg_0.h5
+  - /spiff/ssage/karmma_data/LN_dg_RS_linmu_bias/Inputs/mock_dg_0.h5
+
+run_labels:
+  - NUTS
+  - MCLMC
