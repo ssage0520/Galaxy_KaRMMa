@@ -1,12 +1,21 @@
 from .config import KarmmaConfig
-from .karmma import KarmmaSampler
-from .structs import KarmmaPosition, NUTSInfo, ThetaParams, XlmParams
+from .forward_model import ForwardModel
+from .structs import (
+    KarmmaPosition,
+    MCLMCInfo,
+    NUTSInfo,
+    ThetaParams,
+    WhitenedKarmmaPosition,
+    XlmParams,
+)
 
 __all__ = [
     "KarmmaConfig",
-    "KarmmaSampler",
+    "ForwardModel",
     "KarmmaPosition",
+    "MCLMCInfo",
     "NUTSInfo",
     "ThetaParams",
+    "WhitenedKarmmaPosition",
     "XlmParams",
 ]

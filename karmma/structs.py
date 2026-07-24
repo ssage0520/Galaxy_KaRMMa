@@ -22,6 +22,17 @@ class KarmmaPosition(NamedTuple):
     theta: ThetaParams | None = None
 
 
+class WhitenedKarmmaPosition(NamedTuple):
+    xlm: XlmParams
+    phi: jnp.ndarray  # (n_theta,) flat whitened bias parameters
+
+
+class MCLMCInfo(NamedTuple):
+    logdensity: jnp.ndarray
+    energy_change: jnp.ndarray
+    nonans: jnp.ndarray
+
+
 class NUTSInfo(NamedTuple):
     is_divergent: jnp.ndarray
     num_integration_steps: jnp.ndarray
@@ -30,13 +41,28 @@ class NUTSInfo(NamedTuple):
     logdensity: jnp.ndarray
 
 
-class McmcConfig(NamedTuple):
-    n_warmup: int
+class NutsConfig(NamedTuple):
     n_samples: int
     key: Any
     seed: int
+    num_warmup: int
     step_size: float
-    target_acceptance: float
+    target_acceptance_rate: float
+    imm_shrinkage_to_previous: float
+    infer_theta: bool
+
+
+class MclmcConfig(NamedTuple):
+    n_samples: int
+    key: Any
+    seed: int
+    frac_tune1: float
+    frac_tune2: float
+    frac_tune3: float
+    l_factor: float
+    thinning_warmup: int
+    thinning_sampling: int
+    desired_energy_var: float
     infer_theta: bool
 
 

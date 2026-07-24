@@ -1,3 +1,4 @@
+from .metadata_utils import detect_run_type, imm_blocks, load_run
 from .plotting_utils import (
     plot_1pt_linear,
     plot_1pt_log,
@@ -15,6 +16,9 @@ from .summary_stats_utils import (
 )
 
 __all__ = [
+    "detect_run_type",
+    "imm_blocks",
+    "load_run",
     "plot_1pt_linear",
     "plot_1pt_log",
     "plot_corr",

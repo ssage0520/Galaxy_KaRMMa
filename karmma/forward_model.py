@@ -1,7 +1,3 @@
-import time
-from datetime import timedelta
-
-import blackjax
 import healpy as hp
 import jax
 
@@ -9,17 +5,20 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import jax.scipy.stats as jst
 import numpy as np
-from blackjax.adaptation.base import get_filter_adapt_info_fn
 from scipy.special import legendre_p_all, roots_legendre
 
-from karmma.structs import KarmmaPosition, NUTSInfo, ThetaParams, XlmParams
+from karmma.structs import (
+    KarmmaPosition,
+    ThetaParams,
+    XlmParams,
+)
 from karmma.transforms import alm2map, map2alm
 
 _INVGAMMA_ALPHA_R = 1.0  # TODO: expose in McmcConfig
 _INVGAMMA_BETA_R = (5.0 / 8.0) ** 2.0  # TODO: expose in McmcConfig
 
 
-class KarmmaSampler:
+class ForwardModel:
     def __init__(
         self,
         dg_obs,
@@ -224,93 +223,3 @@ class KarmmaSampler:
             + log_lik
         )
 
-    def sample(
-        self,
-        key,
-        num_warmup,
-        num_samples,
-        initial_position: KarmmaPosition,
-        step_size=0.05,
-        target_acceptance_rate=0.65,
-    ):
-
-        log_prob = jax.jit(self.log_prob)
-
-        t0 = time.perf_counter()
-
-        filter_fn = get_filter_adapt_info_fn(
-            info_keys={"acceptance_rate", "is_divergent", "num_integration_steps"}
-        )
-
-        warmup = blackjax.window_adaptation(
-            blackjax.nuts,
-            logdensity_fn=log_prob,
-            initial_step_size=step_size,
-            target_acceptance_rate=target_acceptance_rate,
-            is_mass_matrix_diagonal=True,
-            progress_bar=True,
-            adaptation_info_fn=filter_fn,
-        )
-        key, warmup_key = jax.random.split(key)
-        print()
-        (wstate, parameters), winfo = warmup.run(
-            warmup_key, initial_position, num_steps=num_warmup
-        )
-
-        wstate.position.xlm.real.block_until_ready()
-        t1 = time.perf_counter()
-        print()
-
-        warmup_steps = np.array(winfo.info.num_integration_steps)
-        time_per_leapfrog = (t1 - t0) / warmup_steps.sum()
-        mean_steps_end = warmup_steps[-20:].mean()
-        time_per_sample = time_per_leapfrog * mean_steps_end
-        est_sampling_time = num_samples * time_per_sample
-
-        print(f"Warmup time: {timedelta(seconds=int(t1 - t0))}")
-        print(f"Adapted step size: {parameters['step_size']:.4f}")
-        print(
-            f"Mean integration steps (warmup): {warmup_steps.mean():.1f}  |  last 20: {mean_steps_end:.1f}"
-        )
-        print(
-            f"Mean acceptance rate (warmup): {jnp.mean(winfo.info.acceptance_rate):.4f}"
-        )
-        print(f"Number of divergences (warmup): {jnp.sum(winfo.info.is_divergent)}")
-        print(
-            f"Estimated sampling time: ~{timedelta(seconds=int(est_sampling_time))}  ({num_samples} samples × ~{time_per_sample:.1f}s/sample)"
-        )
-
-        nuts = blackjax.nuts(log_prob, **parameters)
-
-        key, sample_key = jax.random.split(key)
-        print()
-        _, (states, infos) = blackjax.util.run_inference_algorithm(
-            rng_key=sample_key,
-            inference_algorithm=nuts,
-            num_steps=num_samples,
-            initial_state=wstate,
-            progress_bar=True,
-            transform=lambda state, info: (
-                state.position,
-                NUTSInfo(
-                    is_divergent=info.is_divergent,
-                    num_integration_steps=info.num_integration_steps,
-                    acceptance_rate=info.acceptance_rate,
-                    energy=info.energy,
-                    logdensity=state.logdensity,
-                ),
-            ),
-        )
-        states.xlm.real.block_until_ready()
-        t2 = time.perf_counter()
-        print()
-
-        print(f"Sampling time:    {timedelta(seconds=int(t2 - t1))}")
-        print(f"Total time (w+s): {timedelta(seconds=int(t2 - t0))}")
-        print(
-            f"Mean integration steps: {np.array(infos.num_integration_steps).mean():.1f}"
-        )
-        print(f"Mean acceptance rate: {jnp.mean(infos.acceptance_rate):.4f}")
-        print(f"Number of divergences: {jnp.sum(infos.is_divergent)}")
-
-        return states, infos, parameters, winfo
