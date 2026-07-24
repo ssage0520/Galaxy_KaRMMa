@@ -1,14 +1,27 @@
+"""Shared whitening/preconditioning base class for sampler backends (NUTS, MCLMC)."""
+
+from collections.abc import Callable
+
 import jax
 import jax.flatten_util
 import jax.numpy as jnp
 import numpy as np
 from jax.scipy.sparse.linalg import cg
 
+from karmma.forward_model import ForwardModel
 from karmma.structs import KarmmaPosition, ThetaParams, WhitenedKarmmaPosition
 
 
 class WhitenedSampler:
-    def __init__(self, model):
+    """Base class for sampler backends, holding shared whitening/IMM-preconditioning machinery.
+
+    Parameters
+    ----------
+    model : ForwardModel
+        The forward model to sample from.
+    """
+
+    def __init__(self, model: ForwardModel) -> None:
         self.model = model
         self.V = None
         self.w = None
@@ -22,20 +35,35 @@ class WhitenedSampler:
         kappa_max: float = 1e9,
         verbose: bool = True,
     ) -> np.ndarray:
-        """Dense theta-only covariance-like matrix via Schur complement + CG.
+        """Compute a dense theta-only covariance-like matrix via Schur complement + CG.
 
-        Marginalises over the xlm block with n_theta CG solves against H_xx,
-        then fixes the resulting indefinite n_theta×n_theta Schur complement
-        to PD via |λ| eigenvalue correction. Used directly for eigenbasis
-        reparametrization (see _build_reparam).
-
-        Requires `infer_theta=True` (theta must be part of the sampled
-        position for the Schur complement over the theta block to apply).
+        Parameters
+        ----------
+        position : KarmmaPosition
+            Position to linearize around; `position.theta` must be set
+            (requires the sampler's `infer_theta=True`).
+        tol : float, optional
+            CG solver tolerance, by default 1e-3.
+        maxiter : int, optional
+            CG solver maximum iterations, by default 300.
+        kappa_max : float, optional
+            Maximum condition number enforced on the corrected matrix via
+            eigenvalue-magnitude clipping, by default 1e9.
+        verbose : bool, optional
+            Whether to print progress and diagnostic statistics, by default True.
 
         Returns
         -------
-        np.ndarray of shape (n_theta, n_theta), field-major/bin-minor layout
-        matching jax.flatten_util.ravel_pytree(ThetaParams(...)).
+        np.ndarray
+            Dense (n_theta, n_theta) matrix, field-major/bin-minor layout
+            matching `jax.flatten_util.ravel_pytree(ThetaParams(...))`.
+
+        Notes
+        -----
+        Marginalizes over the xlm block with `n_theta` CG solves against
+        `H_xx`, then fixes the resulting indefinite `n_theta`×`n_theta`
+        Schur complement to positive-definite via `|λ|` eigenvalue
+        correction.
         """
         n_theta = len(ThetaParams._fields) * self.model.Nbins
 
@@ -44,16 +72,19 @@ class WhitenedSampler:
         N_full = flat_pos.shape[0]
         n_x = N_full - n_theta
 
-        def _flat_log_prob(flat):
+        def _flat_log_prob(flat: jax.Array) -> jax.Array:
+            """Evaluate log_prob on a flattened position vector."""
             return self.model.log_prob(unravel_fn(flat))
 
         @jax.jit
-        def _hvp(v):
+        def _hvp(v: jax.Array) -> jax.Array:
+            """Compute the negative log-density Hessian-vector product."""
             _, g = jax.jvp(jax.grad(_flat_log_prob), (flat_pos,), (v,))
             return -g
 
         @jax.jit
-        def _hvp_xx(vx):
+        def _hvp_xx(vx: jax.Array) -> jax.Array:
+            """Restrict `_hvp` to the xlm (non-theta) block."""
             v_full = jnp.zeros(N_full).at[:n_x].set(vx)
             return _hvp(v_full)[:n_x]
 
@@ -115,9 +146,25 @@ class WhitenedSampler:
         kappa_max: float = 1e9,
         verbose: bool = True,
     ) -> None:
-        """Computes dense_theta_imm(...) and eigendecomposes it, storing the
-        whitening transform (self.V, self.w, self.theta0) for theta_to_phi/
-        phi_to_theta."""
+        """Compute and store the whitening eigenbasis transform for theta.
+
+        Sets `self.V`, `self.w`, and `self.theta0`, used by `theta_to_phi`/
+        `phi_to_theta`.
+
+        Parameters
+        ----------
+        initial_position : KarmmaPosition
+            Position to build the reparametrization around; forwarded to
+            `dense_theta_imm`.
+        tol : float, optional
+            Forwarded to `dense_theta_imm`, by default 1e-3.
+        maxiter : int, optional
+            Forwarded to `dense_theta_imm`, by default 300.
+        kappa_max : float, optional
+            Forwarded to `dense_theta_imm`, by default 1e9.
+        verbose : bool, optional
+            Forwarded to `dense_theta_imm`, by default True.
+        """
         dense_theta_matrix = self.dense_theta_imm(
             initial_position, tol, maxiter, kappa_max, verbose
         )
@@ -125,30 +172,73 @@ class WhitenedSampler:
         self.theta0 = initial_position.theta
 
     def theta_to_phi(self, theta: ThetaParams) -> jnp.ndarray:
-        """Physical theta -> whitened phi, via the eigenbasis transform set
-        by _build_reparam."""
+        """Transform physical theta to whitened phi, via the eigenbasis transform.
+
+        Requires `_build_reparam` to have been called first, since it
+        depends on `self.V`/`self.w`/`self.theta0`.
+
+        Parameters
+        ----------
+        theta : ThetaParams
+            Physical theta to transform.
+
+        Returns
+        -------
+        jnp.ndarray
+            Flat whitened phi vector.
+        """
         theta_flat, _ = jax.flatten_util.ravel_pytree(theta)
         theta0_flat, _ = jax.flatten_util.ravel_pytree(self.theta0)
         return (self.V.T @ (theta_flat - theta0_flat)) / jnp.sqrt(self.w)
 
     def phi_to_theta(self, phi: jnp.ndarray) -> ThetaParams:
-        """Whitened phi -> physical theta, via the eigenbasis transform set
-        by _build_reparam."""
+        """Transform whitened phi back to physical theta, via the eigenbasis transform.
+
+        Requires `_build_reparam` to have been called first, since it
+        depends on `self.V`/`self.w`/`self.theta0`.
+
+        Parameters
+        ----------
+        phi : jnp.ndarray
+            Flat whitened phi vector.
+
+        Returns
+        -------
+        ThetaParams
+            Physical theta.
+        """
         theta0_flat, unravel = jax.flatten_util.ravel_pytree(self.theta0)
         theta_flat = theta0_flat + self.V @ (phi * jnp.sqrt(self.w))
         return unravel(theta_flat)
 
-    def _prepare_sampling(self, initial_position: KarmmaPosition):
-        """Whitens `initial_position` (building the reparam as a side effect)
-        and returns the resulting WhitenedKarmmaPosition plus a jitted
-        log_prob wrapper that evaluates self.model.log_prob in phi-space —
-        the setup shared by every sampler backend's sample()."""
+    def _prepare_sampling(
+        self, initial_position: KarmmaPosition
+    ) -> tuple[WhitenedKarmmaPosition, Callable[[WhitenedKarmmaPosition], jax.Array]]:
+        """Whiten `initial_position` and build a phi-space log_prob wrapper.
+
+        Builds the whitening eigenbasis as a side effect (see
+        `_build_reparam`). This is the setup shared by every sampler
+        backend's `sample()`.
+
+        Parameters
+        ----------
+        initial_position : KarmmaPosition
+            Physical (theta-space) starting position.
+
+        Returns
+        -------
+        sampling_position : WhitenedKarmmaPosition
+            `initial_position`, whitened into phi-space.
+        log_prob : Callable[[WhitenedKarmmaPosition], jax.Array]
+            Jitted log-density function operating on whitened positions.
+        """
         self._build_reparam(initial_position)
         sampling_position = WhitenedKarmmaPosition(
             xlm=initial_position.xlm, phi=self.theta_to_phi(initial_position.theta)
         )
 
-        def log_prob(params: WhitenedKarmmaPosition):
+        def log_prob(params: WhitenedKarmmaPosition) -> jax.Array:
+            """Evaluate the model log-density on a whitened (phi-space) position."""
             theta = self.phi_to_theta(params.phi)
             return self.model.log_prob(KarmmaPosition(xlm=params.xlm, theta=theta))
 
@@ -158,7 +248,17 @@ class WhitenedSampler:
         return sampling_position, jax.jit(log_prob)
 
     def _unwhiten(self, states: WhitenedKarmmaPosition) -> KarmmaPosition:
-        """Converts whitened-phi-space sampled states back to a physical
-        (theta-space) KarmmaPosition."""
+        """Convert whitened-phi-space sampled states back to physical theta-space.
+
+        Parameters
+        ----------
+        states : WhitenedKarmmaPosition
+            Sampled states in whitened (phi) space, batched over samples.
+
+        Returns
+        -------
+        KarmmaPosition
+            Sampled states in physical (theta) space, batched over samples.
+        """
         theta = jax.vmap(self.phi_to_theta)(states.phi)
         return KarmmaPosition(xlm=states.xlm, theta=theta)
