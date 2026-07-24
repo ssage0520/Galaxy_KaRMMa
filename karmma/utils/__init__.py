@@ -1,3 +1,5 @@
+"""Utilities for loading, summarizing, and plotting KaRMMa MCMC run output."""
+
 from .metadata_utils import detect_run_type, imm_blocks, load_run
 from .plotting_utils import (
     plot_1pt_linear,

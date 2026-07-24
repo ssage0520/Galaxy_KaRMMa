@@ -10,8 +10,7 @@ import h5py as h5
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from karmma import ForwardModel, KarmmaConfig
-from karmma.samplers.mclmc import MCLMCSampler
-from karmma.samplers.nuts import NUTSSampler
+from karmma.samplers import MCLMCSampler, NUTSSampler
 from karmma.structs import (
     KarmmaPosition,
     MclmcConfig,
