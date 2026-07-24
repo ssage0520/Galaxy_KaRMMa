@@ -19,6 +19,20 @@ class WhitenedSampler:
     ----------
     model : ForwardModel
         The forward model to sample from.
+
+    Attributes
+    ----------
+    model : ForwardModel
+        The forward model being sampled from.
+    V : jnp.ndarray or None
+        Eigenvectors of the whitening transform; `None` until `_build_reparam`
+        is called.
+    w : jnp.ndarray or None
+        Eigenvalues of the whitening transform; `None` until `_build_reparam`
+        is called.
+    theta0 : ThetaParams or None
+        Reference theta the whitening transform is centered on; `None`
+        until `_build_reparam` is called.
     """
 
     def __init__(self, model: ForwardModel) -> None:
@@ -92,6 +106,9 @@ class WhitenedSampler:
             print(
                 f"dense_theta_imm: step 1 — {n_theta} b-indicator HVPs ...", flush=True
             )
+        # HVP against unit vector e_{n_x+i} extracts the (n_x+i)-th row of the
+        # full Hessian; stacking one row per theta index gives every row of
+        # the full Hessian that touches the theta block.
         rows_b = jnp.stack(
             [_hvp(jnp.zeros(N_full).at[n_x + i].set(1.0)) for i in range(n_theta)]
         )
@@ -117,6 +134,8 @@ class WhitenedSampler:
             ]
         )
 
+        # Schur complement of the theta block: H_bb - H_bx @ Hxx^-1 @ H_bx^T,
+        # with X solving Hxx @ X = H_bx^T via CG above.
         precision_bb = H_bb_est - H_bx_est @ X.T
 
         if verbose:
@@ -134,8 +153,16 @@ class WhitenedSampler:
 
         S = 0.5 * (precision_bb + precision_bb.T)
         w, U = jnp.linalg.eigh(S)
+        # `position` isn't the true MAP, so the Hessian isn't guaranteed PSD
+        # here — genuine negative curvature can appear, not just CG-solve
+        # noise. This is only used to build an initial guess (the whitening
+        # scale), so only the magnitude of the curvature matters; |w| keeps
+        # that while discarding the sign.
         w_fixed = jnp.clip(jnp.abs(w), min=float(jnp.max(jnp.abs(w))) / kappa_max)
 
+        # precision_bb (via _hvp's -Hessian(log_prob) convention) is a
+        # precision-like matrix; dividing by (rather than multiplying by)
+        # the eigenvalues inverts it into the covariance-like matrix returned.
         return np.array((U / w_fixed) @ U.T)
 
     def _build_reparam(
