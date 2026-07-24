@@ -1,10 +1,53 @@
+"""Summary statistics (correlation function, pseudo-Cl, 1-point PDF) for KaRMMa fields."""
+
 import healpy as hp
 import numpy as np
 import pymaster as nmt
 import treecorr
 
 
-def get_corrfunc(field_maps, mask, min_sep=None, max_sep=300.0, nbins=15, npatch=50):
+def get_corrfunc(
+    field_maps: np.ndarray,
+    mask: np.ndarray,
+    min_sep: float | None = None,
+    max_sep: float = 300.0,
+    nbins: int = 15,
+    npatch: int = 50,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute the real-space 2-point correlation function, per tomographic-bin pair.
+
+    Uses treecorr's scalar-scalar (KK) correlation with jackknife
+    covariance estimation.
+
+    Parameters
+    ----------
+    field_maps : np.ndarray
+        Field values per tomographic bin, shape (n_zbins, npix)
+        (full-sky HEALPix maps).
+    mask : np.ndarray
+        Boolean survey mask, shape (npix,).
+    min_sep : float or None, optional
+        Minimum angular separation in arcmin, by default the map's pixel
+        resolution.
+    max_sep : float, optional
+        Maximum angular separation in arcmin, by default 300.0.
+    nbins : int, optional
+        Number of separation bins, by default 15.
+    npatch : int, optional
+        Number of jackknife patches for covariance estimation, by
+        default 50.
+
+    Returns
+    -------
+    corr : np.ndarray
+        Correlation function, shape (n_zbins, n_zbins, nbins).
+    errors : np.ndarray
+        Jackknife standard errors, same shape as `corr`.
+    bin_centres : np.ndarray
+        Geometric-mean separation of each bin, shape (nbins,).
+    bin_edges : np.ndarray
+        Separation bin edges, shape (nbins + 1,).
+    """
     nside = hp.npix2nside(field_maps.shape[1])
 
     if min_sep is None:
@@ -53,7 +96,37 @@ def get_corrfunc(field_maps, mask, min_sep=None, max_sep=300.0, nbins=15, npatch
     return corr, errors, bin_centres, bin_edges
 
 
-def get_field_bins(field, mask, n_bins=46, n_sigma_linear=4):
+def get_field_bins(
+    field: np.ndarray, mask: np.ndarray, n_bins: int = 46, n_sigma_linear: float = 4
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute two sets of histogram bin edges per tomographic bin, for the 1-point PDF.
+
+    Despite the name, both sets of edges are linearly spaced — `linear_bins`
+    and `log_bins` differ in range and intended plot y-axis scale, not bin
+    spacing: `linear_bins` is truncated to `n_sigma_linear` standard
+    deviations (a linear-y-axis view of the bulk of the distribution, see
+    `plot_1pt_linear`), while `log_bins` spans the field's full min-max
+    range (a log-y-axis view of the tails, see `plot_1pt_log`).
+
+    Parameters
+    ----------
+    field : np.ndarray
+        Field values per tomographic bin, shape (n_zbins, npix).
+    mask : np.ndarray
+        Boolean survey mask, shape (npix,).
+    n_bins : int, optional
+        Number of bin edges (n_bins - 1 histogram bins), by default 46.
+    n_sigma_linear : float, optional
+        Number of standard deviations `linear_bins` extends to, by
+        default 4.
+
+    Returns
+    -------
+    linear_bins : np.ndarray
+        Bin edges truncated to `n_sigma_linear` std, shape (n_zbins, n_bins).
+    log_bins : np.ndarray
+        Bin edges spanning the field's full range, shape (n_zbins, n_bins).
+    """
     n_zbins = field.shape[0]
     linear_bins = []
     log_bins = []
@@ -79,7 +152,34 @@ def get_field_bins(field, mask, n_bins=46, n_sigma_linear=4):
     return np.array(linear_bins), np.array(log_bins)
 
 
-def get_1ptfunc(field_maps, mask, linear_bins, log_bins):
+def get_1ptfunc(
+    field_maps: np.ndarray,
+    mask: np.ndarray,
+    linear_bins: np.ndarray,
+    log_bins: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute 1-point histograms of a field, per tomographic bin, in both binning schemes.
+
+    Parameters
+    ----------
+    field_maps : np.ndarray
+        Field values per tomographic bin, shape (n_zbins, npix).
+    mask : np.ndarray
+        Boolean survey mask, shape (npix,).
+    linear_bins : np.ndarray
+        Per-bin histogram edges, as returned by `get_field_bins`, shape
+        (n_zbins, n_bins).
+    log_bins : np.ndarray
+        Per-bin histogram edges, as returned by `get_field_bins`, shape
+        (n_zbins, n_bins).
+
+    Returns
+    -------
+    pdf_linear : np.ndarray
+        Histogram counts using `linear_bins`, shape (n_zbins, n_bins - 1).
+    pdf_log : np.ndarray
+        Histogram counts using `log_bins`, shape (n_zbins, n_bins - 1).
+    """
     n_zbins = field_maps.shape[0]
     n_linear = linear_bins.shape[1] - 1
     n_log = log_bins.shape[1] - 1
@@ -95,7 +195,30 @@ def get_1ptfunc(field_maps, mask, linear_bins, log_bins):
     return pdf_linear, pdf_log
 
 
-def setup_pseudo_cls(mask, n_ell_bins=17):
+def setup_pseudo_cls(
+    mask: np.ndarray, n_ell_bins: int = 17
+) -> tuple[nmt.NmtWorkspace, nmt.NmtBin, np.ndarray, np.ndarray]:
+    """Set up NaMaster bandpowers and the mode-coupling matrix for pseudo-Cl estimation.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Survey mask, shape (npix,).
+    n_ell_bins : int, optional
+        Number of log-spaced multipole bandpower edges, by default 17.
+
+    Returns
+    -------
+    workspace : nmt.NmtWorkspace
+        Precomputed mode-coupling matrix for this mask, reusable across
+        `get_pseudo_cls` calls.
+    nmt_ell_bins : nmt.NmtBin
+        Bandpower binning scheme.
+    eff_ell : np.ndarray
+        Effective multipole of each bandpower.
+    ell_edges : np.ndarray
+        Multipole bandpower edges (genuinely log-spaced, via `np.logspace`).
+    """
     nside = hp.npix2nside(mask.shape[0])
     lmax = 2 * nside
 
@@ -116,7 +239,30 @@ def setup_pseudo_cls(mask, n_ell_bins=17):
     return workspace, nmt_ell_bins, eff_ell, ell_edges
 
 
-def get_pseudo_cls(field_maps, mask, nmt_ell_bins, workspace):
+def get_pseudo_cls(
+    field_maps: np.ndarray,
+    mask: np.ndarray,
+    nmt_ell_bins: nmt.NmtBin,
+    workspace: nmt.NmtWorkspace,
+) -> np.ndarray:
+    """Compute mode-decoupled pseudo-Cl angular power spectra, per tomographic-bin pair.
+
+    Parameters
+    ----------
+    field_maps : np.ndarray
+        Field values per tomographic bin, shape (n_zbins, npix).
+    mask : np.ndarray
+        Survey mask, shape (npix,).
+    nmt_ell_bins : nmt.NmtBin
+        Bandpower binning scheme, as returned by `setup_pseudo_cls`.
+    workspace : nmt.NmtWorkspace
+        Precomputed mode-coupling matrix, as returned by `setup_pseudo_cls`.
+
+    Returns
+    -------
+    np.ndarray
+        Pseudo-Cl power spectra, shape (n_zbins, n_zbins, n_ell).
+    """
     nside = hp.npix2nside(mask.shape[0])
     lmax = 2 * nside
     n_zbins = field_maps.shape[0]

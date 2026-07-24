@@ -1,6 +1,8 @@
-"""Loads KaRMMa output directories for metadata.ipynb, normalizing the NUTS-era
-and MCLMC-era `mcmc_metadata.h5` schemas into one dict shape per run so the
-notebook can iterate over a mix of both without branching on sampler type.
+"""Loads KaRMMa output directories for metadata.ipynb.
+
+Normalizes the NUTS-era and MCLMC-era `mcmc_metadata.h5` schemas into one
+dict shape per run so the notebook can iterate over a mix of both without
+branching on sampler type.
 """
 
 import os
@@ -28,9 +30,27 @@ MCLMC_ONLY_KEYS = (
 )
 
 
-def detect_run_type(metadata_path):
-    """Classifies a mcmc_metadata.h5 file as "nuts" or "mclmc" by key presence
-    (neither schema carries an explicit sampler-type field)."""
+def detect_run_type(metadata_path: str) -> str:
+    """Classify an mcmc_metadata.h5 file as "nuts" or "mclmc" by key presence.
+
+    Neither schema carries an explicit sampler-type field, so this checks
+    for a key unique to each.
+
+    Parameters
+    ----------
+    metadata_path : str
+        Path to an mcmc_metadata.h5 file.
+
+    Returns
+    -------
+    str
+        "nuts" or "mclmc".
+
+    Raises
+    ------
+    ValueError
+        If neither schema's marker key is present.
+    """
     with h5.File(metadata_path, "r") as f:
         if "acceptance_rate" in f:
             return "nuts"
@@ -42,25 +62,67 @@ def detect_run_type(metadata_path):
         )
 
 
-def _read_theta_group(f, group):
-    # Stacks the 6 named datasets under `group` into one (..., 6) array.
+def _read_theta_group(f: h5.File, group: str) -> np.ndarray:
+    """Stack the 6 named theta datasets under `group` into one array.
+
+    Parameters
+    ----------
+    f : h5py.File
+        Open HDF5 file to read from.
+    group : str
+        Path within `f` holding one dataset per `THETA_FIELDS` entry.
+
+    Returns
+    -------
+    np.ndarray
+        Stacked array, shape (..., 6).
+    """
     return np.stack([f[f"{group}/{field}"][:] for field in THETA_FIELDS], axis=-1)
 
 
-def _read_scalar_or_array(dataset):
-    return dataset[()] if dataset.shape == () else dataset[:]
+def _read_scalar_or_array(dataset: h5.Dataset) -> int | float | bool | np.ndarray:
+    """Read an HDF5 dataset, converting scalars to native Python types.
+
+    Parameters
+    ----------
+    dataset : h5py.Dataset
+        Dataset to read; may be scalar-shaped or array-shaped.
+
+    Returns
+    -------
+    int, float, bool, or np.ndarray
+        `dataset.item()` for scalars (native Python type, not a numpy
+        scalar), `dataset[:]` for arrays.
+    """
+    return dataset[()].item() if dataset.shape == () else dataset[:]
 
 
-def load_run(output_dir, mock_dg_path, label, color):
-    """Loads one output directory into a run dict for the metadata notebook.
+def load_run(output_dir: str, mock_dg_path: str, label: str, color: str) -> dict:
+    """Load one output directory into a run dict for the metadata notebook.
 
-    Keys present regardless of sampler type: label, color, output_dir, type,
-    seed, step_size, inverse_mass_matrix, log_prob,
-    theta_reparam, xlm_real, xlm_imag, theta_samples, nbins, n_real, n_imag,
-    n_samples, true_theta, ess_xlm_real, ess_xlm_imag, ess_theta, mcmc_config.
-    `extra` holds whatever's specific to the detected type (NUTS_ONLY_KEYS or
-    MCLMC_ONLY_KEYS). `mcmc_config` holds the full mcmc config dump (empty
-    dict for pre-refactor runs that predate that group existing).
+    Parameters
+    ----------
+    output_dir : str
+        Directory containing `samples.h5` and `mcmc_metadata.h5`.
+    mock_dg_path : str
+        Path to the mock datafile holding `true_theta`.
+    label : str
+        Plot label for this run.
+    color : str
+        Plot color for this run.
+
+    Returns
+    -------
+    dict
+        Run data. Keys present regardless of sampler type: `label`,
+        `color`, `output_dir`, `type` ("nuts" or "mclmc"), `seed`,
+        `step_size`, `inverse_mass_matrix`, `log_prob`, `theta_reparam`,
+        `xlm_real`, `xlm_imag`, `theta_samples`, `nbins`, `n_real`,
+        `n_imag`, `n_samples`, `true_theta`, `ess_xlm_real`,
+        `ess_xlm_imag`, `ess_theta`. `extra` holds whatever's specific to
+        the detected type (`NUTS_ONLY_KEYS` or `MCLMC_ONLY_KEYS`).
+        `mcmc_config` holds the full mcmc config dump (empty dict for
+        pre-refactor runs that predate that group existing).
     """
     metadata_path = os.path.join(output_dir, "mcmc_metadata.h5")
     samples_path = os.path.join(output_dir, "samples.h5")
@@ -131,12 +193,30 @@ def load_run(output_dir, mock_dg_path, label, color):
     }
 
 
-def imm_blocks(run, key="inverse_mass_matrix"):
-    """Slices a flat inverse-mass-matrix-shaped vector (`key` in `run`) into
-    (xlm_real, xlm_imag, phi) blocks. The phi block is left flat (n_phi =
-    nbins * 6) rather than reshaped by bin: phi is a whitened linear
-    combination of all bins/parameters together, so unlike the xlm blocks it
-    has no natural per-bin structure to reshape into."""
+def imm_blocks(
+    run: dict, key: str = "inverse_mass_matrix"
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Slice a flat IMM-shaped vector into (xlm_real, xlm_imag, phi) blocks.
+
+    Parameters
+    ----------
+    run : dict
+        Run dict, as returned by `load_run`.
+    key : str, optional
+        Key in `run` holding the flat vector to slice, by default
+        "inverse_mass_matrix".
+
+    Returns
+    -------
+    real_block : np.ndarray
+        xlm real-part block, reshaped to (nbins, n_real).
+    imag_block : np.ndarray
+        xlm imaginary-part block, reshaped to (nbins, n_imag).
+    phi_block : np.ndarray
+        Whitened theta (phi) block, left flat (length nbins * 6) since
+        phi is a linear combination across all bins/parameters together
+        and has no natural per-bin structure to reshape into.
+    """
     nbins, n_real, n_imag = run["nbins"], run["n_real"], run["n_imag"]
     n_phi = nbins * len(THETA_FIELDS)
     flat = run[key]

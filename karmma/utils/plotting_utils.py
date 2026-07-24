@@ -1,3 +1,5 @@
+"""Plotting utilities for KaRMMa maps, correlation functions, pseudo-Cl, and 1-point PDFs."""
+
 import healpy as hp
 import matplotlib.pyplot as plt
 import numpy as np
@@ -7,8 +9,38 @@ from matplotlib.patches import Patch
 
 
 def plot_map(
-    dm_map, mask, minmax, cmap="viridis", cb_label=r"$\delta_m$", title=None, ax=None
-):
+    dm_map: np.ndarray,
+    mask: np.ndarray,
+    minmax: tuple[float, float],
+    cmap: str = "viridis",
+    cb_label: str = r"$\delta_m$",
+    title: str | None = None,
+    ax: plt.Axes | None = None,
+) -> skyproj.DESSkyproj:
+    r"""Plot a HEALPix map on a DES sky projection, masking unseen pixels.
+
+    Parameters
+    ----------
+    dm_map : np.ndarray
+        HEALPix map values.
+    mask : np.ndarray
+        Survey mask; pixels outside it are drawn as unseen.
+    minmax : tuple of float
+        (vmin, vmax) colorbar range.
+    cmap : str, optional
+        Colormap name, by default "viridis".
+    cb_label : str, optional
+        Colorbar label, by default r"$\delta_m$".
+    title : str or None, optional
+        Plot title, by default None.
+    ax : matplotlib.axes.Axes or None, optional
+        Axes to draw into, by default None (creates a new one).
+
+    Returns
+    -------
+    skyproj.DESSkyproj
+        The sky projection object drawn into.
+    """
     masked_map = dm_map.copy()
     masked_map[~mask.astype(bool)] = hp.UNSEEN
     vmin, vmax = minmax
@@ -20,12 +52,28 @@ def plot_map(
     return sp
 
 
-def plot_dm_comparison(dm_true, dm_mean, mask, n_samples=None, cmap="viridis"):
-    """Compare true dm map with sample-mean dm map.
+def plot_dm_comparison(
+    dm_true: np.ndarray,
+    dm_mean: np.ndarray,
+    mask: np.ndarray,
+    n_samples: int | None = None,
+    cmap: str = "viridis",
+) -> None:
+    """Plot the true dm map beside the sample-mean dm map, per tomographic bin.
 
-    dm_true : (nbins, npix)
-    dm_mean : (nbins, npix)  — pre-averaged over samples
-    n_samples : int, optional — shown in the title
+    Parameters
+    ----------
+    dm_true : np.ndarray
+        True dm map, shape (nbins, npix).
+    dm_mean : np.ndarray
+        Sample-mean dm map (pre-averaged over samples), shape (nbins, npix).
+    mask : np.ndarray
+        Survey mask.
+    n_samples : int or None, optional
+        Number of samples averaged into `dm_mean`, shown in the title,
+        by default None.
+    cmap : str, optional
+        Colormap name, by default "viridis".
     """
     nbins = dm_true.shape[0]
     count_str = f"{n_samples} samples" if n_samples is not None else "samples"
@@ -59,7 +107,28 @@ def plot_dm_comparison(dm_true, dm_mean, mask, n_samples=None, cmap="viridis"):
     plt.show()
 
 
-def plot_corr(corr_samples, corr_true, bin_centres, ylim=None, interval=68):
+def plot_corr(
+    corr_samples: np.ndarray,
+    corr_true: np.ndarray,
+    bin_centres: np.ndarray,
+    ylim: tuple[float, float] | None = None,
+    interval: float = 68,
+) -> None:
+    r"""Plot sample/true correlation-function ratios, per tomographic-bin pair.
+
+    Parameters
+    ----------
+    corr_samples : np.ndarray
+        Per-sample correlation function, shape (n_samples, nbins, nbins, nsep).
+    corr_true : np.ndarray
+        True correlation function, shape (nbins, nbins, nsep).
+    bin_centres : np.ndarray
+        Separation bin centres, shape (nsep,).
+    ylim : tuple of float or None, optional
+        Y-axis limits, by default (0.95, 1.05).
+    interval : float, optional
+        Percentile interval to shade around the sample mean, by default 68.
+    """
     if ylim is None:
         ylim = (0.95, 1.05)
 
@@ -118,7 +187,31 @@ def plot_corr(corr_samples, corr_true, bin_centres, ylim=None, interval=68):
     plt.show()
 
 
-def plot_pseudo_cl(cl_samples, cl_true, eff_ell, nside, ylim=None, interval=68):
+def plot_pseudo_cl(
+    cl_samples: np.ndarray,
+    cl_true: np.ndarray,
+    eff_ell: np.ndarray,
+    nside: int,
+    ylim: tuple[float, float] | None = None,
+    interval: float = 68,
+) -> None:
+    """Plot sample/true pseudo-Cl ratios, per tomographic-bin pair.
+
+    Parameters
+    ----------
+    cl_samples : np.ndarray
+        Per-sample pseudo-Cl, shape (n_samples, nbins, nbins, n_ell).
+    cl_true : np.ndarray
+        True pseudo-Cl, shape (nbins, nbins, n_ell).
+    eff_ell : np.ndarray
+        Effective multipole of each bandpower, shape (n_ell,).
+    nside : int
+        HEALPix resolution parameter, used to set the x-axis range.
+    ylim : tuple of float or None, optional
+        Y-axis limits, by default (0.95, 1.05).
+    interval : float, optional
+        Percentile interval to shade around the sample mean, by default 68.
+    """
     if ylim is None:
         ylim = (0.95, 1.05)
 
@@ -176,7 +269,25 @@ def plot_pseudo_cl(cl_samples, cl_true, eff_ell, nside, ylim=None, interval=68):
     plt.show()
 
 
-def plot_1pt_linear(pdf_linear_samples, pdf_linear_true, linear_bins, interval=68):
+def plot_1pt_linear(
+    pdf_linear_samples: np.ndarray,
+    pdf_linear_true: np.ndarray,
+    linear_bins: np.ndarray,
+    interval: float = 68,
+) -> None:
+    r"""Plot sample/true 1-point PDF histograms, per tomographic bin, on a linear y-axis.
+
+    Parameters
+    ----------
+    pdf_linear_samples : np.ndarray
+        Per-sample histogram counts, shape (n_samples, nbins, n_bins - 1).
+    pdf_linear_true : np.ndarray
+        True histogram counts, shape (nbins, n_bins - 1).
+    linear_bins : np.ndarray
+        Per-bin histogram edges, as returned by `get_field_bins`.
+    interval : float, optional
+        Percentile interval to shade around the sample mean, by default 68.
+    """
     lo_p = (100 - interval) / 2
     hi_p = (100 + interval) / 2
 
@@ -228,7 +339,25 @@ def plot_1pt_linear(pdf_linear_samples, pdf_linear_true, linear_bins, interval=6
     plt.show()
 
 
-def plot_1pt_log(pdf_log_samples, pdf_log_true, log_bins, interval=68):
+def plot_1pt_log(
+    pdf_log_samples: np.ndarray,
+    pdf_log_true: np.ndarray,
+    log_bins: np.ndarray,
+    interval: float = 68,
+) -> None:
+    r"""Plot sample/true 1-point PDF histograms, per tomographic bin, on a log y-axis.
+
+    Parameters
+    ----------
+    pdf_log_samples : np.ndarray
+        Per-sample histogram counts, shape (n_samples, nbins, n_bins - 1).
+    pdf_log_true : np.ndarray
+        True histogram counts, shape (nbins, n_bins - 1).
+    log_bins : np.ndarray
+        Per-bin histogram edges, as returned by `get_field_bins`.
+    interval : float, optional
+        Percentile interval to shade around the sample mean, by default 68.
+    """
     lo_p = (100 - interval) / 2
     hi_p = (100 + interval) / 2
 
