@@ -1,3 +1,5 @@
+"""Forward model: xlm harmonic coefficients to galaxy counts, and the posterior log-density."""
+
 import healpy as hp
 import jax
 
@@ -19,20 +21,85 @@ _INVGAMMA_BETA_R = (5.0 / 8.0) ** 2.0  # TODO: expose in McmcConfig
 
 
 class ForwardModel:
+    """Forward model from harmonic-space xlm coefficients to the galaxy-count log-density.
+
+    Attributes
+    ----------
+    dg_obs : np.ndarray
+        Observed galaxy overdensity maps, shape (Nbins, npix).
+    mask : np.ndarray
+        Survey mask, shape (npix,); cast to bool.
+    alpha : np.ndarray
+        Shifted-lognormal shape parameter, per bin.
+    beta : np.ndarray
+        Shifted-lognormal scale parameter, per bin.
+    CL : np.ndarray
+        Target (physical, non-Gaussian) angular power spectra, shape
+        (Nbins, Nbins, gen_lmax + 1); off-diagonal entries `CL[i, j]`
+        (i != j) are cross-power spectra between bins i and j.
+    Nbins : int
+        Number of tomographic bins (`dg_obs.shape[0]`).
+    Nside : int
+        HEALPix resolution parameter, from `dg_obs[0]`.
+    pixel_size : float
+        Pixel angular size in radians (`hp.nside2resol(Nside)`).
+    map_shape : tuple of int
+        Shape of `dg_obs`.
+    infer_theta : bool
+        Whether `theta` is sampled jointly with `xlm` (True) or held
+        fixed at `theta_fixed` (False).
+    N_bar : np.ndarray
+        Average galaxy count per pixel, per bin — averaged across the
+        full sky, not just the observed/masked region.
+    Ng_obs : np.ndarray
+        Observed galaxy counts per masked pixel, per bin —
+        `(dg_obs[:, mask] + 1) * N_bar`, rounded to the nearest integer.
+    theta_fixed : ThetaParams or None
+        Fixed bias parameters; `None` unless `infer_theta=False`.
+    lmax : int
+        Maximum multipole of the output maps, by default `2 * Nside`.
+    gen_lmax : int
+        Maximum multipole used internally for Gaussian field generation,
+        by default `3 * Nside - 1` (higher than `lmax`, to avoid
+        aliasing from the nonlinear lognormal transform).
+    ell, emm : np.ndarray
+        Harmonic (l, m) index arrays at `lmax` resolution, from
+        `hp.Alm.getlm(lmax)`.
+    gen_ell, gen_emm : np.ndarray
+        Harmonic (l, m) index arrays at `gen_lmax` resolution.
+    pixwin : np.ndarray or None
+        Pixel window function.
+    CL_G : np.ndarray
+        Gaussianized angular power spectra: the covariance of the
+        underlying Gaussian field whose shifted-lognormal transform
+        reproduces `CL`. Set by `compute_CL_G`.
+    L_G : np.ndarray
+        Per-multipole Cholesky factor of `CL_G`, used by `apply_CL_G` to
+        correlate independent per-bin Gaussian `xlm` draws into the
+        physically-correlated Gaussian field. Set by `compute_CL_G`.
+    _real_idx, _imag_idx : np.ndarray
+        Indices selecting the free (non-redundant) real/imaginary
+        harmonic modes of a real field, for packing/unpacking
+        `XlmParams` (see `get_xlm`).
+    n_modes : int
+        Total number of free `xlm` parameters (`len(_real_idx) +
+        len(_imag_idx)`).
+    """
+
     def __init__(
         self,
-        dg_obs,
-        mask,
-        CL,
-        alpha,
-        beta,
-        N_bar=None,
-        infer_theta=False,
-        theta_fixed=None,
-        lmax=None,
-        gen_lmax=None,
-        pixwin=None,
-    ):
+        dg_obs: np.ndarray,
+        mask: np.ndarray,
+        CL: np.ndarray,
+        alpha: np.ndarray,
+        beta: np.ndarray,
+        N_bar: np.ndarray | None = None,
+        infer_theta: bool = False,
+        theta_fixed: ThetaParams | None = None,
+        lmax: int | None = None,
+        gen_lmax: int | None = None,
+        pixwin: np.ndarray | None = None,
+    ) -> None:
         self.dg_obs = dg_obs
         self.mask = mask.astype(bool)
 
@@ -70,7 +137,49 @@ class ForwardModel:
         self._imag_idx = np.where((self.gen_ell > 1) & (self.gen_emm > 0))[0]
         self.n_modes = len(self._real_idx) + len(self._imag_idx)
 
-    def _compute_CL_G_binpair(self, i, j, ell_array, P_ell, w):
+    def _compute_CL_G_binpair(
+        self, i: int, j: int, ell_array: np.ndarray, P_ell: np.ndarray, w: np.ndarray
+    ) -> np.ndarray:
+        """Gaussianize the (i, j) bin-pair power spectrum `CL[i, j]` into `CL_G[i, j]`.
+
+        Parameters
+        ----------
+        i, j : int
+            Tomographic bin indices.
+        ell_array : np.ndarray
+            Multipoles 0..gen_lmax.
+        P_ell : np.ndarray
+            Legendre polynomials `P_ell(mu)` at the quadrature nodes
+            `mu`, shape (gen_lmax + 1, n_quad).
+        w : np.ndarray
+            Gauss-Legendre quadrature weights, shape (n_quad,).
+
+        Returns
+        -------
+        np.ndarray
+            Gaussianized power spectrum for bin pair (i, j), shape
+            (gen_lmax + 1,).
+
+        Notes
+        -----
+        Three steps, via Gauss-Legendre quadrature:
+
+        1. Forward Legendre transform: `CL[i, j]` (the target,
+           non-Gaussian power spectrum) to `xi_NG`, its real-space
+           angular correlation function, evaluated at the quadrature
+           nodes.
+        2. Gaussianize pointwise: `xi_G = log(1 + xi_NG / (beta_i *
+           beta_j)) / (alpha_i * alpha_j)`, the inverse of the
+           shifted-lognormal covariance relation implied by
+           `dm = beta * (exp(alpha * y) - 1)`.
+        3. Inverse Legendre transform: `xi_G` back to `CL_G[i, j]`.
+
+        The monopole/dipole (l=0,1) are forced to ~0 (exactly 0
+        off-diagonal, a tiny 1e-20 floor on-diagonal to avoid a
+        zero-variance mode breaking the later per-multipole Cholesky
+        decomposition in `compute_CL_G`) — a zero-mean fluctuation field
+        has no physically meaningful monopole/dipole.
+        """
         weighted_CL = (2 * ell_array + 1) * self.CL[i, j]
         xi_NG = weighted_CL @ P_ell / (4 * np.pi)
         xi_G = np.log(1 + xi_NG / (self.beta[i] * self.beta[j])) / (
@@ -81,7 +190,22 @@ class ForwardModel:
         CL_G_ij[:2] = 1e-20 if i == j else 0.0
         return CL_G_ij
 
-    def compute_CL_G(self, order=2):
+    def compute_CL_G(self, order: int = 2) -> None:
+        """Gaussianize `CL` into `CL_G`, and Cholesky-factorize it into `L_G`.
+
+        Parameters
+        ----------
+        order : int, optional
+            Gauss-Legendre quadrature order multiplier — uses
+            `order * gen_lmax` quadrature points, by default 2.
+
+        Notes
+        -----
+        Calls `_compute_CL_G_binpair` once per bin pair (i, j) with
+        i >= j, mirroring the result across the diagonal since `CL_G` is
+        symmetric in the bin indices. Sets `self.CL_G` and `self.L_G`
+        (`CL_G`'s per-multipole Cholesky factor, used by `apply_CL_G`).
+        """
         mu, w = roots_legendre(order * self.gen_lmax)
         ell_array = np.arange(self.gen_lmax + 1)
         P_ell = legendre_p_all(self.gen_lmax, mu).squeeze()
@@ -97,22 +221,94 @@ class ForwardModel:
         L_T = np.linalg.cholesky(CL_T)
         self.L_G = np.moveaxis(L_T, 0, 2)
 
-    def get_xlm(self, xlm: XlmParams):
+    def get_xlm(self, xlm: XlmParams) -> jnp.ndarray:
+        """Unpack `xlm`'s free real/imaginary parameters into the full complex harmonic array.
+
+        Parameters
+        ----------
+        xlm : XlmParams
+            Free (non-redundant) real/imaginary harmonic coefficients, at
+            the indices given by `_real_idx`/`_imag_idx`.
+
+        Returns
+        -------
+        jnp.ndarray
+            Full complex harmonic-coefficient array, shape
+            (Nbins, len(gen_ell)). Modes not in `_real_idx`/`_imag_idx`
+            are left at zero: the monopole/dipole (l<=1, excluded per
+            `_compute_CL_G_binpair`), and the imaginary part of m=0
+            modes (forced to zero by the reality condition of a
+            real-valued map).
+        """
         _real = jnp.zeros((self.Nbins, len(self.gen_ell)), dtype=jnp.float64)
         _imag = jnp.zeros_like(_real)
         _real = _real.at[:, self._real_idx].set(xlm.real)
         _imag = _imag.at[:, self._imag_idx].set(xlm.imag)
         return _real + 1j * _imag
 
-    def apply_CL_G(self, xlm):
+    def apply_CL_G(self, xlm_array: jnp.ndarray) -> jnp.ndarray:
+        """Correlate independent per-bin harmonic coefficients into the physical Gaussian field.
+
+        Parameters
+        ----------
+        xlm_array : jnp.ndarray
+            Full complex harmonic-coefficient array (independent per
+            bin), as returned by `get_xlm`, shape (Nbins, len(gen_ell)).
+
+        Returns
+        -------
+        jnp.ndarray
+            Correlated complex harmonic coefficients of the underlying
+            Gaussian field, same shape as `xlm_array`.
+
+        Notes
+        -----
+        Applies `L_G` (the per-multipole Cholesky factor of `CL_G`, set
+        by `compute_CL_G`) as a per-multipole linear mixing across bins
+        (the same matrix for every m at a given ell), turning
+        independent unit-variance `xlm_array` draws into correlated
+        `ylm` with the target cross-bin covariance `CL_G`. The
+        `1/sqrt(2)` factor (undone for m=0 via the `gen_emm == 0`
+        branches) splits the variance evenly between the real and
+        imaginary parts for m>0 modes; at m=0 the coefficient is purely
+        real (no imaginary part, per the reality condition), so it alone
+        must carry the full variance instead.
+        """
         L_expanded = self.L_G[:, :, self.gen_ell]
-        ylm_real = jnp.einsum("ijm,jm->im", L_expanded, xlm.real) / jnp.sqrt(2)
-        ylm_imag = jnp.einsum("ijm,jm->im", L_expanded, xlm.imag) / jnp.sqrt(2)
+        ylm_real = jnp.einsum("ijm,jm->im", L_expanded, xlm_array.real) / jnp.sqrt(2)
+        ylm_imag = jnp.einsum("ijm,jm->im", L_expanded, xlm_array.imag) / jnp.sqrt(2)
         ylm_real = jnp.where(self.gen_emm == 0, ylm_real * jnp.sqrt(2), ylm_real)
         ylm_imag = jnp.where(self.gen_emm == 0, 0.0, ylm_imag)
         return ylm_real + 1j * ylm_imag
 
-    def x2deff(self, xlm: XlmParams, theta: ThetaParams):
+    def x2deff(self, xlm: XlmParams, theta: ThetaParams) -> jnp.ndarray:
+        """Forward-model `xlm` into the effective density field used for the likelihood.
+
+        Follows `x2dm`'s pipeline up through the harmonic-space density
+        contrast `dm_lm`, then additionally applies a theta-dependent
+        smoothing filter before transforming back to a map.
+
+        Parameters
+        ----------
+        xlm : XlmParams
+            Free harmonic coefficients (see `get_xlm`).
+        theta : ThetaParams
+            Bias/nuisance parameters; only `c` (smoothing amplitude) and
+            `log_R` (smoothing scale) are used here — the rest are used
+            later, in `dm_to_binom_params`.
+
+        Returns
+        -------
+        jnp.ndarray
+            Effective density contrast map, shape (Nbins, npix).
+
+        Notes
+        -----
+        After `dm_lm` (see `x2dm`), applies
+        `filt = (1 + c * b_ell) * pixwin`, where `b_ell` is a Gaussian
+        smoothing kernel of scale `R = exp(log_R) * pixel_size`, then
+        transforms back to a map.
+        """
         xlm_full = self.get_xlm(xlm)
         ylm = self.apply_CL_G(xlm_full)
 
@@ -132,7 +328,28 @@ class ForwardModel:
         )
         return alm2map(dm_lm * filt, self.Nside, self.lmax)
 
-    def x2dm(self, xlm: XlmParams):
+    def x2dm(self, xlm: XlmParams) -> jnp.ndarray:
+        """Forward-model `xlm` into the raw density contrast map.
+
+        Parameters
+        ----------
+        xlm : XlmParams
+            Free harmonic coefficients (see `get_xlm`).
+
+        Returns
+        -------
+        jnp.ndarray
+            Raw density contrast map, shape (Nbins, npix).
+
+        Notes
+        -----
+        Pipeline: `xlm` -> full harmonic array (`get_xlm`) -> correlated
+        Gaussian field harmonics (`apply_CL_G`) -> Gaussian field map
+        `ys` (`alm2map`) -> shifted-lognormal transform to the density
+        contrast `dm = beta * (exp(alpha * ys - 0.5 * alpha^2) - 1)`
+        (the `-0.5 * alpha^2` term zeros its mean) -> back to harmonic
+        space (`map2alm`), pixel-window-filtered if set -> back to a map.
+        """
         xlm_full = self.get_xlm(xlm)
         ylm = self.apply_CL_G(xlm_full)
 
@@ -145,7 +362,53 @@ class ForwardModel:
             dm_lm = dm_lm * self.pixwin[self.ell]
         return alm2map(dm_lm, self.Nside, self.lmax)
 
-    def dm_to_binom_params(self, deff, theta: ThetaParams):
+    def dm_to_binom_params(
+        self, deff: jnp.ndarray, theta: ThetaParams
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Convert the effective density field into binomial (n, p) count parameters.
+
+        Parameters
+        ----------
+        deff : jnp.ndarray
+            Effective density contrast, as returned by `x2deff`.
+        theta : ThetaParams
+            Bias/nuisance parameters; uses `A_t`, `log_T` (detection
+            threshold/sharpness) and `mu0`, `a` (variance-depletion
+            offset/slope).
+
+        Returns
+        -------
+        n : jnp.ndarray
+            Binomial number-of-trials parameter, per pixel per bin.
+        p : jnp.ndarray
+            Binomial success-probability parameter, per pixel per bin.
+
+        Notes
+        -----
+        `A = log1p(deff)` is a log-density variable, and
+        `sig = sigmoid((A - A_t) / T)` is a detection/completeness
+        function of it: `sig -> 1` well above the threshold `A_t`,
+        `sig -> 0` well below it, with `T = exp(log_T)` controlling the
+        transition sharpness. `b` renormalizes the calibrated mean count
+        (`mean_Ng = b * (1 + deff) * sig * N_bar`) so its sky average
+        over the observed mask matches `N_bar`, given the current
+        `deff` realization.
+
+        A second mean count, `mean_Ng_prime`, is then computed at a
+        density perturbed by `mu = mu0 + a * deff`. The difference
+        `mean_Ng - mean_Ng_prime` becomes the binomial `p`, and
+        `n = mean_Ng / p` is backed out so `n * p` still equals the
+        calibrated mean exactly. This decouples the binomial's mean
+        from its variance: a direct fit to `mean_Ng` alone would force
+        a fixed mean-variance relationship, but real galaxy counts need
+        that variance independently tunable (sub- or super-Poissonian)
+        — `mu0`/`a` dial the effective variance via how far
+        `mean_Ng_prime` sits from `mean_Ng`, while `n` keeps the mean
+        itself pinned to the calibrated target.
+
+        TODO: this is the heart of the forward model and deserves a
+        more thorough writeup later.
+        """
         A_t = theta.A_t[:, np.newaxis]
         T = jnp.exp(theta.log_T)[:, np.newaxis]
         mu0 = theta.mu0[:, np.newaxis]
@@ -172,18 +435,41 @@ class ForwardModel:
 
         return n, p
 
-    def make_random_xlm(self, key):
-        rk, ik = jax.random.split(key)
-        return XlmParams(
-            real=jax.random.normal(
-                rk, shape=(self.Nbins, len(self._real_idx)), dtype=jnp.float64
-            ),
-            imag=jax.random.normal(
-                ik, shape=(self.Nbins, len(self._imag_idx)), dtype=jnp.float64
-            ),
-        )
+    def log_prob(self, params: KarmmaPosition) -> jnp.ndarray:
+        """Compute the (unnormalized) posterior log-density at `params`.
 
-    def log_prob(self, params: KarmmaPosition):
+        Parameters
+        ----------
+        params : KarmmaPosition
+            Position to evaluate; `params.theta` is used if
+            `self.infer_theta`, otherwise `self.theta_fixed`.
+
+        Returns
+        -------
+        jnp.ndarray
+            Log-density, summing the binomial likelihood, the `xlm`
+            prior, and (if `infer_theta`) `theta`'s prior and
+            change-of-variables Jacobian.
+
+        Notes
+        -----
+        `xlm` has an i.i.d. `N(0, 1)` prior on both its real and
+        imaginary free parameters.
+
+        When `infer_theta`, two additional terms are added:
+
+        - `log_jacobian_theta`: `log_T`/`log_R` are sampled in
+          log-space, but `T`/`R` themselves have flat priors, so
+          sampling in log-space adds a `+log_T`/`+log_R` Jacobian term
+          each (`d(T)/d(log T) = T`, and likewise for `R`).
+        - `log_prior_theta`: an `InvGamma(alpha, beta)` prior on `R^2`
+          (not `R` itself), with fixed hyperparameters
+          `_INVGAMMA_ALPHA_R`/`_INVGAMMA_BETA_R` (not yet exposed via
+          config — see the module-level TODOs). Combines the
+          `R -> R^2` Jacobian (another `+log_R`, dropping the constant
+          `log(2)` term) with the InvGamma log-density in terms of
+          `log_R`.
+        """
         theta = params.theta if self.infer_theta else self.theta_fixed
 
         deff = self.x2deff(params.xlm, theta)
@@ -221,5 +507,32 @@ class ForwardModel:
             + log_jacobian_theta
             + log_prior_theta
             + log_lik
+        )
+
+    def make_random_xlm(self, key: jax.Array) -> XlmParams:
+        """Draw a random `xlm` from its prior (i.i.d. standard normal per component).
+
+        Parameters
+        ----------
+        key : jax.Array
+            JAX PRNG key.
+
+        Returns
+        -------
+        XlmParams
+            Random draw, matching `log_prob`'s `N(0, 1)` prior on `xlm`.
+
+        TODO: pair this with a function that pushes a random `xlm` draw
+        through the forward model to generate a full mock/synthetic
+        `dg_obs` observation.
+        """
+        rk, ik = jax.random.split(key)
+        return XlmParams(
+            real=jax.random.normal(
+                rk, shape=(self.Nbins, len(self._real_idx)), dtype=jnp.float64
+            ),
+            imag=jax.random.normal(
+                ik, shape=(self.Nbins, len(self._imag_idx)), dtype=jnp.float64
+            ),
         )
 
