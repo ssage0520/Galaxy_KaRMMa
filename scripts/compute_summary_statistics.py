@@ -1,3 +1,14 @@
+"""Compute correlation function, pseudo-Cl, and 1-point PDF summary statistics for a run.
+
+Computes each requested summary statistic for both the true `dm` map and
+every posterior sample in `samples.h5`, then writes the results to
+`summary_statistics.h5` in the config's `io_dir`.
+
+Examples
+--------
+>>> python scripts/compute_summary_statistics.py config/mclmc.yaml --recompute corr pseudo_cl 1pt
+"""
+
 import argparse
 import os
 import sys
@@ -17,15 +28,22 @@ from karmma.utils import (
 )
 
 
-def overwrite_dataset(group, key, data):
+def overwrite_dataset(group: h5.Group, key: str, data: np.ndarray) -> None:
+    """Create or overwrite a dataset in an HDF5 group.
+
+    Parameters
+    ----------
+    group : h5py.Group
+        HDF5 group to write into.
+    key : str
+        Dataset name within `group`.
+    data : np.ndarray
+        Data to write; replaces the existing dataset if `key` is already present.
+    """
     if key in group:
         del group[key]
     group[key] = data
 
-
-# Run as follows:
-# config=/path/to/config.yaml
-# nice -n 10 python compute_summary_statistics.py $config --recompute corr pseudo_cl 1pt
 
 parser = argparse.ArgumentParser()
 parser.add_argument("configfile")

@@ -1,3 +1,14 @@
+"""Run KaRMMa MCMC sampling (NUTS or MCLMC, chosen by config) and write output to disk.
+
+Reads an analysis/IO/MCMC configuration from a YAML file, builds a
+`ForwardModel`, dispatches to the configured sampler backend, and writes
+posterior draws and sampler diagnostics to the config's `io_dir`.
+
+Examples
+--------
+>>> python scripts/run_karmma.py config/mclmc.yaml
+"""
+
 import os
 import sys
 
