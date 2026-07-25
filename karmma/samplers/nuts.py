@@ -1,3 +1,5 @@
+"""NUTS sampler backend, built on WhitenedSampler's shared whitening/preconditioning."""
+
 import time
 from datetime import timedelta
 
@@ -5,46 +7,63 @@ import blackjax
 import jax
 import jax.numpy as jnp
 import numpy as np
-from blackjax.adaptation.base import get_filter_adapt_info_fn
+from blackjax.adaptation.base import AdaptationInfo, get_filter_adapt_info_fn
 
 from karmma.samplers.base import WhitenedSampler
 from karmma.structs import KarmmaPosition, NUTSInfo
 
 
 class NUTSSampler(WhitenedSampler):
+    """Samples from a whitened KarmmaPosition using NUTS, via blackjax's window adaptation."""
+
     def sample(
         self,
-        key,
-        num_warmup,
-        num_samples,
+        key: jax.Array,
+        num_warmup: int,
+        num_samples: int,
         initial_position: KarmmaPosition,
         initial_imm: np.ndarray,
         imm_shrinkage_to_previous: float = 0.0,
         step_size: float = 0.05,
         target_acceptance_rate: float = 0.65,
-    ):
-        """Runs NUTS, seeding window_adaptation's inverse mass matrix.
+    ) -> tuple[KarmmaPosition, NUTSInfo, dict, AdaptationInfo]:
+        """Run NUTS, seeding window adaptation's inverse mass matrix from `initial_imm`.
 
-        Requires a blackjax build with `initial_inverse_mass_matrix` /
-        `imm_shrinkage_to_previous` support in `window_adaptation` (the
-        jax_karmma_dev environment) — stock blackjax raises a TypeError.
+        Parameters
+        ----------
+        key : jax.Array
+            JAX PRNG key, split internally for warmup and sampling.
+        num_warmup : int
+            Number of window-adaptation warmup steps.
+        num_samples : int
+            Number of post-warmup samples to draw.
+        initial_position : KarmmaPosition
+            Physical (theta-space) starting position; whitened internally as
+            the first step (see `WhitenedSampler._prepare_sampling`).
+        initial_imm : np.ndarray
+            Initial diagonal inverse mass matrix, in BlackJax pytree-flat
+            layout for the whitened position.
+        imm_shrinkage_to_previous : float, optional
+            Pseudo-count controlling shrinkage of each warmup window's
+            adapted inverse mass matrix toward the previous window's,
+            by default 0.0 (no persistence, matches Stan's behavior).
+        step_size : float, optional
+            Initial step size for warmup, by default 0.05.
+        target_acceptance_rate : float, optional
+            Target acceptance rate for step-size adaptation, by default 0.65.
 
-        `initial_position` is the physical (theta-space) position; whitening
-        is computed here as the first step (see
-        `WhitenedSampler._build_reparam`). `initial_imm` must be a 1-D
-        diagonal IMM in BlackJax pytree-flat layout for the whitened
-        position — typically `np.ones(N_full)`, since phi is already
-        whitened to ~unit variance. The returned `states` is converted back
-        to a physical-coordinate KarmmaPosition (theta, not phi) before
-        returning, so callers never see phi-space values.
-
-        `tuned_params["inverse_mass_matrix"]`'s theta block is phi-space-
-        scaled (expected, not a bug — needed to interpret it as a diagnostic
-        later), but `infos.logdensity`'s log-density values remain in true
-        physical units regardless, since the wrapped log_prob below
-        evaluates `self.model.log_prob` at the untransformed point, adding
-        no constant (the phi -> theta map is linear with a phi-independent
-        Jacobian, which doesn't affect NUTS/HMC dynamics or acceptance).
+        Returns
+        -------
+        states : KarmmaPosition
+            Posterior samples (physical theta-space), batched over `num_samples`.
+        infos : NUTSInfo
+            Per-sample NUTS diagnostics (divergences, integration steps,
+            acceptance rate, energy, log density), batched over `num_samples`.
+        tuned_params : dict
+            Tuned `step_size`/`inverse_mass_matrix` from window adaptation.
+        winfo : blackjax.adaptation.base.AdaptationInfo
+            Full warmup-adaptation info; `.info` holds the filtered
+            per-window warmup diagnostics used for the printed summary.
         """
         sampling_position, log_prob = self._prepare_sampling(initial_position)
 
@@ -72,14 +91,20 @@ class NUTSSampler(WhitenedSampler):
             )
             # Forces real synchronization before the with-block exits — otherwise
             # JAX's async dispatch lets this return (and the progress bar close,
-            # stamped at 100%) long before the warmup scan has actually finished.
+            # stamped at 100%) long before the warmup has actually finished.
             jax.block_until_ready((wstate, tuned_params))
 
         t1 = time.perf_counter()
         print()
 
+        # TODO: this whole estimated-sampling-time block is a pre-progress-bar
+        # leftover — now that blackjax.progress_bar shows live timing during
+        # sampling itself, this upfront estimate is largely redundant. Revisit
+        # when NUTS's output/printing is reworked more generally.
         warmup_steps = np.array(winfo.info.num_integration_steps)
         time_per_leapfrog = (t1 - t0) / warmup_steps.sum()
+        # Last 20 steps approximate steady-state (post-adaptation) integration-step
+        # count, for a rough sampling-time estimate.
         mean_steps_end = warmup_steps[-20:].mean()
         time_per_sample = time_per_leapfrog * mean_steps_end
         est_sampling_time = num_samples * time_per_sample

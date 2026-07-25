@@ -1,3 +1,5 @@
+"""MCLMC sampler backend, built on WhitenedSampler's shared whitening/preconditioning."""
+
 import time
 from datetime import timedelta
 
@@ -7,16 +9,19 @@ import jax.flatten_util
 import jax.numpy as jnp
 import numpy as np
 from blackjax.adaptation.mclmc_adaptation import MCLMCAdaptationState
+from blackjax.mcmc.mclmc import MCLMCInfo as RawMCLMCInfo
 
 from karmma.samplers.base import WhitenedSampler
 from karmma.structs import KarmmaPosition, MCLMCInfo
 
 
 class MCLMCSampler(WhitenedSampler):
+    """Samples from a whitened KarmmaPosition using MCLMC, via blackjax's L/step-size tuning."""
+
     def sample(
         self,
-        key,
-        num_samples,
+        key: jax.Array,
+        num_samples: int,
         initial_position: KarmmaPosition,
         initial_imm: np.ndarray,
         frac_tune1: float = 0.1,
@@ -26,33 +31,54 @@ class MCLMCSampler(WhitenedSampler):
         desired_energy_var: float = 5e-4,
         thinning_warmup: int = 5,
         thinning_sampling: int = 5,
-    ):
-        """Runs MCLMC, seeding its diagonal preconditioner from `initial_imm`.
+    ) -> tuple[KarmmaPosition, MCLMCInfo, MCLMCAdaptationState]:
+        """Run MCLMC, seeding its diagonal preconditioner from `initial_imm`.
 
-        Requires the jax_karmma_dev blackjax build (mclmc's call-time kernel
-        args, mclmc_find_L_and_step_size's logdensity_fn/l_factor kwargs).
-        `initial_position` is the physical (theta-space) position — whitening
-        is computed here as the first step (see WhitenedSampler._build_reparam).
-        `initial_imm` must be a 1-D diagonal IMM in BlackJax pytree-flat
-        layout for the whitened position, typically `np.ones(N_full)`, since
-        phi is already whitened to ~unit variance. `num_samples` is the
-        number of samples actually saved (post-thinning), not a raw
-        integrator-step budget.
+        Parameters
+        ----------
+        key : jax.Array
+            JAX PRNG key, split internally for initialization, warmup, and sampling.
+        num_samples : int
+            Number of samples actually saved (post-thinning), not a raw
+            integrator-step budget.
+        initial_position : KarmmaPosition
+            Physical (theta-space) starting position; whitened internally as
+            the first step (see `WhitenedSampler._prepare_sampling`).
+        initial_imm : np.ndarray
+            Initial diagonal inverse mass matrix, in BlackJax pytree-flat
+            layout for the whitened position — typically `np.ones(N_full)`,
+            since phi is already whitened to ~unit variance.
+        frac_tune1 : float, optional
+            Fraction of warmup spent on phase 1 (step-size dual averaging),
+            by default 0.1.
+        frac_tune2 : float, optional
+            Fraction of warmup spent on phase 2 (diagonal preconditioning),
+            by default 0.3.
+        frac_tune3 : float, optional
+            Fraction of warmup spent on phase 3 (tuning `L` via effective
+            sample size), by default 0.1.
+        l_factor : float, optional
+            Factor scaling the estimated autocorrelation length to obtain
+            the momentum decoherence length `L`, by default 0.4.
+        desired_energy_var : float, optional
+            Target per-step energy-change variance for step-size dual
+            averaging, by default 5e-4.
+        thinning_warmup : int, optional
+            Thinning applied to phase 3 only (phases 1+2 always run
+            unthinned), by default 5.
+        thinning_sampling : int, optional
+            Thinning applied during the final sampling phase, by default 5.
 
-        Warmup runs as two chained `mclmc_find_L_and_step_size` calls, since
-        phases 1+2 and phase 3 want opposite thinning:
-
-        - Phases 1+2 (step size + diagonal IMM) always run unthinned — they
-          only carry O(dim) running accumulators, so thinning gains nothing
-          and only coarsens the step-size feedback.
-        - Phase 3 (L via effective-sample-size) is thinned by
-          `thinning_warmup`, since its FFT-based ESS calculation over the
-          full position is what actually blows up memory at scale, while its
-          estimate is fairly insensitive to draw spacing.
-
-        Call 2 is seeded from call 1's tuned `state`/`params` (not
-        `init_state`/`initial_params`) so phase 3 continues the chain instead
-        of restarting cold.
+        Returns
+        -------
+        states : KarmmaPosition
+            Posterior samples (physical theta-space), batched over `num_samples`.
+        infos : MCLMCInfo
+            Per-sample MCLMC diagnostics (log density, energy change,
+            non-NaN fraction), aggregated over each thinning block (see
+            `sample_info`).
+        tuned_params : MCLMCAdaptationState
+            Tuned `L`, `step_size`, and `inverse_mass_matrix` from warmup.
         """
         sampling_position, log_prob = self._prepare_sampling(initial_position)
         dim = blackjax.util.pytree_size(sampling_position)
@@ -61,17 +87,34 @@ class MCLMCSampler(WhitenedSampler):
 
         key, key_init, key_warmup1, key_warmup2, key_sample = jax.random.split(key, 5)
 
-        def sample_info(info):
-            """Aggregates raw per-step MCLMC info over a thinning block.
+        def sample_info(info: RawMCLMCInfo) -> RawMCLMCInfo:
+            """Aggregate raw per-step MCLMC info over one thinning block.
 
-            logdensity takes the last raw step's value — exactly matching
-            the block's final (saved) position — rather than an aggregate;
-            energy_change/kinetic_change are genuinely mean-zero step-error
-            diagnostics where an RMS magnitude is meaningful, but RMS-ing
-            logdensity (uniformly large-magnitude and negative) collapses to
-            |logdensity|, silently flipping its sign. nonans is a 0/1
-            indicator, so it needs a mean (fraction clean), not RMS — RMS of
-            a 0/1 array is sqrt(fraction), not the fraction itself.
+            Parameters
+            ----------
+            info : RawMCLMCInfo
+                Raw per-step MCLMC info for every step in the block.
+
+            Returns
+            -------
+            RawMCLMCInfo
+                Block-aggregated info, with one value per field instead of
+                one per raw step.
+
+            Notes
+            -----
+            Each field uses a different reduction, since a single "RMS
+            everything" or "mean everything" rule would silently corrupt
+            the results:
+
+            - `logdensity` takes the last raw step's value (matching the
+              block's final, saved position) rather than an aggregate.
+            - `energy_change`/`kinetic_change` are genuinely mean-zero
+              step-error diagnostics, so an RMS magnitude is meaningful
+              over the block.
+            - `nonans` is a 0/1 indicator, so it needs a mean (fraction
+              clean), not RMS — RMS of a 0/1 array is `sqrt(fraction)`,
+              not the fraction itself.
             """
             return info._replace(
                 logdensity=info.logdensity[-1],
@@ -83,16 +126,14 @@ class MCLMCSampler(WhitenedSampler):
         init_state = blackjax.mcmc.mclmc.init(
             position=sampling_position, logdensity_fn=log_prob, rng_key=key_init
         )
+        # L/step_size match blackjax's own params=None default (see
+        # mclmc_adaptation.py) — done explicitly here only to seed
+        # inverse_mass_matrix with initial_imm instead of ones(dim).
         initial_params = MCLMCAdaptationState(
             L=jnp.sqrt(dim),
             step_size=jnp.sqrt(dim) * 0.25,
             inverse_mass_matrix=initial_imm,
         )
-
-        # desired_energy_var only matters via mclmc_find_L_and_step_size's own
-        # kwarg (the step-size dual-averaging target) — build_kernel's use of
-        # it is dead unless desired_energy_var_max_ratio is also set, which
-        # we don't do, so it's passed only to the calls below.
 
         # Call 1: phases 1+2 only, always unthinned — raw kernel, since
         # thinning=1 needs no thin_kernel wrapper.
@@ -116,7 +157,7 @@ class MCLMCSampler(WhitenedSampler):
             )
             # Forces real synchronization before the with-block exits — otherwise
             # JAX's async dispatch lets this return (and the progress bar close,
-            # stamped at 100%) long before the tuning scan has actually finished.
+            # stamped at 100%) long before the warmup has actually finished.
             jax.block_until_ready((state_12, params_12))
 
         imm_12 = np.array(params_12.inverse_mass_matrix)
@@ -160,6 +201,11 @@ class MCLMCSampler(WhitenedSampler):
                 frac_tune3=frac_tune3,
                 desired_energy_var=desired_energy_var,
                 params=params_12,
+                # blackjax's internal L estimate is step_size * (num_steps / ess),
+                # counted in thin_kernel-wrapped (thinned) calls — but each such
+                # call actually advances the chain by thinning_warmup raw steps,
+                # so the raw-step autocorrelation length is thinning_warmup times
+                # longer than that count. Scaling l_factor up compensates.
                 l_factor=l_factor * thinning_warmup,
             )
             # See the analogous comment on Call 1 — same reason.
@@ -185,9 +231,7 @@ class MCLMCSampler(WhitenedSampler):
         )
 
         warmup_calls = warmup_calls_12 + warmup_calls_3
-        warmup_integration_steps = (
-            warmup_calls_12 * 1 + warmup_calls_3 * thinning_warmup
-        )
+        warmup_integration_steps = warmup_calls_12 + warmup_calls_3 * thinning_warmup
         imm = np.array(tuned_params.inverse_mass_matrix)
 
         L_finite = bool(np.isfinite(tuned_params.L))
@@ -207,8 +251,6 @@ class MCLMCSampler(WhitenedSampler):
             f"Inv. mass matrix: min={imm.min():.3e}  mean={imm.mean():.3e}  max={imm.max():.3e}"
         )
 
-        # Bakes the tuned L/step_size/IMM into a fixed SamplingAlgorithm;
-        # thin_algorithm (not thin_kernel) wraps that.
         mclmc_sampler = blackjax.mclmc(
             logdensity_fn=log_prob,
             L=tuned_params.L,

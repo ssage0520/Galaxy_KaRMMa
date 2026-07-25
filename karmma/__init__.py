@@ -1,3 +1,5 @@
+"""Hierarchical Bayesian reconstruction of galaxy density fields from photometric galaxy counts."""
+
 from .config import KarmmaConfig
 from .forward_model import ForwardModel
 from .structs import (
