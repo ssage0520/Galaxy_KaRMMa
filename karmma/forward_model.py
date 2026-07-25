@@ -68,7 +68,7 @@ class ForwardModel:
     gen_ell, gen_emm : np.ndarray
         Harmonic (l, m) index arrays at `gen_lmax` resolution.
     pixwin : np.ndarray or None
-        Pixel window function.
+        Pixel window function, indexed by multipole (length >= lmax + 1).
     CL_G : np.ndarray
         Gaussianized angular power spectra: the covariance of the
         underlying Gaussian field whose shifted-lognormal transform

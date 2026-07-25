@@ -280,12 +280,12 @@ class WhitenedSampler:
         Parameters
         ----------
         states : WhitenedKarmmaPosition
-            Sampled states in whitened (phi) space, batched over samples.
+            Sampled states in whitened phi-space, batched over samples.
 
         Returns
         -------
         KarmmaPosition
-            Sampled states in physical (theta) space, batched over samples.
+            Sampled states in physical theta-space, batched over samples.
         """
         theta = jax.vmap(self.phi_to_theta)(states.phi)
         return KarmmaPosition(xlm=states.xlm, theta=theta)

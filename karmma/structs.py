@@ -34,7 +34,8 @@ class ThetaParams(NamedTuple):
     c : jnp.ndarray
         Gaussian smooth coupling amplitude (unconstrained).
     log_R : jnp.ndarray
-        log(R / theta_pix), dimensionless pixel-scale units.
+        log(R / pixel_size), dimensionless pixel-scale units (`pixel_size`
+        being `ForwardModel.pixel_size`).
     mu0 : jnp.ndarray
         Variance depletion offset (intercept, unconstrained).
     a : jnp.ndarray
@@ -213,13 +214,16 @@ class AnalysisConfig(NamedTuple):
     nside : int
         HEALPix resolution parameter.
     alpha : np.ndarray
-        Per-bin shifted-lognormal shape parameter.
+        Shifted-lognormal shape parameter, per bin.
     beta : np.ndarray
-        Per-bin shifted-lognormal scale parameter.
+        Shifted-lognormal scale parameter, per bin.
     cl : np.ndarray
-        Per-bin-pair angular power spectra.
+        Target (physical, non-Gaussian) angular power spectra, shape
+        (Nbins, Nbins, gen_lmax + 1); off-diagonal entries `cl[i, j]`
+        (i != j) are cross-power spectra between bins i and j.
     pixwin : np.ndarray or None
-        Pixel window function, or `None` if not applied.
+        Pixel window function, indexed by multipole (length >= lmax + 1),
+        or `None` if not applied.
     """
 
     nbins: int
@@ -240,11 +244,12 @@ class IoConfig(NamedTuple):
     io_dir : str
         Directory to write sampling output to.
     dg_obs : np.ndarray
-        Observed galaxy overdensity maps.
+        Observed galaxy overdensity maps, shape (Nbins, npix).
     mask : np.ndarray
-        Survey mask.
+        Survey mask, shape (npix,); cast to bool.
     N_bar : np.ndarray
-        Mean galaxy count per pixel, per bin.
+        Average galaxy count per pixel, per bin — averaged across the
+        full sky, not just the observed/masked region.
     initial_position : KarmmaPosition
         Starting position for sampling.
     theta_fixed : ThetaParams or None
