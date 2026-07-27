@@ -9,11 +9,7 @@ import jax.scipy.stats as jst
 import numpy as np
 from scipy.special import legendre_p_all, roots_legendre
 
-from karmma.structs import (
-    KarmmaPosition,
-    ThetaParams,
-    XlmParams,
-)
+from karmma.structs import KarmmaPosition, ThetaParams, XlmParams
 from karmma.transforms import alm2map, map2alm
 
 _INVGAMMA_ALPHA_R = 1.0  # TODO: expose in McmcConfig
@@ -281,6 +277,46 @@ class ForwardModel:
         ylm_imag = jnp.where(self.gen_emm == 0, 0.0, ylm_imag)
         return ylm_real + 1j * ylm_imag
 
+    @staticmethod
+    def gn(x: jnp.ndarray, N: int, lbda: jnp.ndarray) -> jnp.ndarray:
+        """Evaluate the G_N point-transformation for all tomographic bins at once.
+
+        Parameters
+        ----------
+        x : jnp.ndarray
+            Standard-normal latent Gaussian field values, shape (Nbins, ...)
+            (e.g. one HEALPix map per bin).
+        N : int
+            Transformation order. Currently ``2``
+            (shifted lognormal) or ``3`` are supported.
+        lbda : jnp.ndarray
+            Transformation parameters, shape ``(N, Nbins)``: rows ``(alpha,
+            beta)`` for ``N=2``, or ``(a, b, c)`` for ``N=3``, one column per
+            bin.
+
+        Returns
+        -------
+        jnp.ndarray
+            Transformed field, same shape as `x`.
+
+        Raises
+        ------
+        ValueError
+            If `N` is not `2` or `3`.
+        """
+        if N == 2:
+            alpha, beta = lbda[..., jnp.newaxis]
+            return beta * jnp.exp(alpha * x - 0.5 * alpha**2) - beta
+
+        elif N == 3:
+            a, b, c = lbda[..., jnp.newaxis]
+            arg = jnp.exp(a * x - 0.5 * a**2) + b * x + c
+            norm = 1.0 / (1.0 + c)
+            return norm * arg - 1.0
+
+        else:
+            raise ValueError(f"Unknown model type: {N}")
+
     def x2deff(self, xlm: XlmParams, theta: ThetaParams) -> jnp.ndarray:
         """Forward-model `xlm` into the effective density field used for the likelihood.
 
@@ -535,4 +571,3 @@ class ForwardModel:
                 ik, shape=(self.Nbins, len(self._imag_idx)), dtype=jnp.float64
             ),
         )
-
