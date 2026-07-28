@@ -658,10 +658,6 @@ class ForwardModel:
         -------
         XlmParams
             Random draw, matching `log_prob`'s `N(0, 1)` prior on `xlm`.
-
-        TODO: pair this with a function that pushes a random `xlm` draw
-        through the forward model to generate a full mock/synthetic
-        `dg_obs` observation.
         """
         rk, ik = jax.random.split(key)
         return XlmParams(
@@ -672,3 +668,65 @@ class ForwardModel:
                 ik, shape=(self.Nbins, len(self._imag_idx)), dtype=jnp.float64
             ),
         )
+
+    def generate_mock_dg_obs(
+        self, xlm: XlmParams, theta: ThetaParams, key: jax.Array
+    ) -> jnp.ndarray:
+        """Generate a synthetic `dg_obs` realization from a given `xlm`/`theta`.
+
+        Parameters
+        ----------
+        xlm : XlmParams
+            Free harmonic coefficients (see `get_xlm`) — the latent truth
+            to generate a mock observation from.
+        theta : ThetaParams
+            Bias/nuisance parameters.
+        key : jax.Array
+            JAX PRNG key for the binomial draw.
+
+        Returns
+        -------
+        jnp.ndarray
+            Synthetic galaxy overdensity map, shape (Nbins, npix), in the
+            same `dg_obs = counts/N_bar - 1` convention `log_prob` expects.
+
+        Notes
+        -----
+        Pipeline: `xlm` -> `x2deff` -> `dm_to_binom_params` -> `(n, p)` ->
+        `jax.random.binomial(key, round(n), p)` (`n` is rounded since
+        `dm_to_binom_params` backs it out as `mean_Ng / p`, generally
+        non-integer) -> `counts / N_bar - 1`. Uses whichever `G_N`
+        transform (`self.gn_order`) this model is configured with
+        transparently, via `x2deff`.
+        """
+        deff = self.x2deff(xlm, theta)
+        n, p = self.dm_to_binom_params(deff, theta)
+        counts = jax.random.binomial(key, jnp.round(n), p)
+        return counts / self.N_bar[:, None] - 1.0
+
+    def make_random_mock(
+        self, key: jax.Array, theta: ThetaParams
+    ) -> tuple[XlmParams, jnp.ndarray]:
+        """Draw a random `xlm` and generate its corresponding synthetic `dg_obs`.
+
+        Parameters
+        ----------
+        key : jax.Array
+            JAX PRNG key; split internally into an `xlm`-draw key (see
+            `make_random_xlm`) and a binomial-draw key (see
+            `generate_mock_dg_obs`).
+        theta : ThetaParams
+            Bias/nuisance parameters.
+
+        Returns
+        -------
+        xlm : XlmParams
+            The randomly-drawn latent truth.
+        dg_obs : jnp.ndarray
+            Its corresponding synthetic galaxy overdensity map, shape
+            (Nbins, npix).
+        """
+        xlm_key, obs_key = jax.random.split(key)
+        xlm = self.make_random_xlm(xlm_key)
+        dg_obs = self.generate_mock_dg_obs(xlm, theta, obs_key)
+        return xlm, dg_obs
