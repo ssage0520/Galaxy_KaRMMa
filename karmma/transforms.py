@@ -1,25 +1,30 @@
 """SHT transforms for KaRMMa.
 
-ducc0-based, JIT-compatible. Supports jax.grad (reverse mode) and
-jax.hessian = jacfwd(jacrev) (forward-over-reverse). All bins are passed
-as a single ntrans call. nside/lmax/spin must be Python literals (not traced
-JAX values). Spin-2 is supported via the spin argument.
+ducc0-based, JIT-compatible via jaxbind. All bins are passed as a single
+ntrans call. nside/lmax/spin must be Python literals (not traced JAX
+values). Spin-2 is supported via the spin argument. Supports jax.grad,
+jax.hessian, and jax.jacrev(jax.jacrev(...)).
 
-Notes
------
-Two-layer structure so that jacfwd can differentiate through the gradient trace:
+`jaxbind.get_linear_call` registers a true JAX primitive with its own
+jvp/transpose rules, so JAX derives every derivative directly from the
+ducc0 synthesis/adjoint_synthesis pair — no hand-written adjoint.
 
-  Inner layer  (_synthesis, _adjoint_synthesis) — custom_jvp
-    Bare linear callbacks. JVP = same linear op applied to the tangent.
-    vmap_method='sequential' required for jax.hessian (which vmaps internally).
+The SHT is real-linear but not complex-linear (complex alm in, real map
+out), and JAX's transpose rule for a linear primitive assumes
+complex-linearity. So the primitive operates on the interleaved real
+view of the complex alm array,
 
-  Outer layer  (_alm2map, _map2alm) — custom_vjp
-    Validated adjoints (reverse mode). _fwd functions call the inner
-    custom_jvp primitives — NOT the outer custom_vjp functions — so that
-    jacfwd can apply JVP through them.
+    v = [Re a_0, Im a_0, Re a_1, Im a_1, ...],  shape (..., 2 * n_alm)
 
-jax.hessian works; jacrev(jacrev) does not (transposing a pure_callback
-is unsupported by JAX).
+which is bit-identical to the complex array's memory layout — the
+callbacks reinterpret it with a zero-copy `ndarray.view`, and ducc0
+reads/writes the FFI buffers directly. In this representation the
+transpose of `synthesis` is `adjoint_synthesis` with the m>0
+coefficients doubled (each stored m>0 coefficient contributes to both +m
+and -m in the real sum), verified to machine precision by a dot-product
+test. Everything else — the complex/real repacking, the pixel weights,
+the 4π/n_pix normalization, and the compensating 1/2 on m>0 in
+`map2alm` — lives in JAX-space and is differentiated natively.
 """
 
 import jax
@@ -27,7 +32,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import time
 import urllib.request
-from functools import lru_cache, partial
+from functools import cache, lru_cache
 from pathlib import Path
 
 import astropy.io.fits as fits
@@ -36,6 +41,7 @@ import ducc0.sht
 import healpy as hp
 import jax.numpy as jnp
 import numpy as np
+from jaxbind import get_linear_call
 
 
 @lru_cache(maxsize=1)
@@ -109,377 +115,148 @@ def get_pixel_weights(nside: int) -> np.ndarray:
     return w8map + 1.0
 
 
-@lru_cache(maxsize=2)
-def get_ms(lmax: int) -> np.ndarray:
-    """Return the m-index array for all alm coefficients up to lmax.
+@cache
+def _sht_ops(nside: int, lmax: int, spin: int, nthreads: int) -> tuple:
+    """Build the forward/adjoint SHT primitive pair for one configuration.
+
+    Parameters
+    ----------
+    nside : int
+        HEALPix resolution parameter.
+    lmax : int
+        Maximum multipole; also used as mmax.
+    spin : int
+        Spin of the transform (0 or 2).
+    nthreads : int
+        ducc0 thread count; 0 means all hardware threads.
+
+    Returns
+    -------
+    tuple
+        `(synthesis_op, adjoint_synthesis_op)`. Each is a JAX primitive
+        taking one array and returning a 1-tuple of arrays;
+        `synthesis_op` maps real-packed alm (..., 2 * n_alm) to a map
+        (..., n_pix), and `adjoint_synthesis_op` maps back. Each is
+        registered as the other's transpose.
+
+    Notes
+    -----
+    Never evicted (`@cache`, unbounded) on purpose: jaxbind identifies
+    the callbacks by `id()`, baked into the compiled executable, so a
+    collected closure whose address got reused would silently corrupt
+    results.
+
+    The configuration is captured by closure rather than passed through
+    jaxbind's `kwargs` channel, which avoids a `pickle.loads` on every
+    single call.
+    """
+    geo = ducc0.healpix.Healpix_Base(nside, "RING").sht_info()
+    geo = {k: geo[k] for k in ("theta", "phi0", "nphi", "ringstart")}
+    n_pix = hp.nside2npix(nside)
+    n_real = 2 * hp.Alm.getsize(lmax)  # real degrees of freedom per component
+    m0_end = 2 * (lmax + 1)  # end of the m=0 block, in real DOFs
+
+    def _synthesis(
+        out: tuple[np.ndarray, ...],
+        args: tuple[np.ndarray, ...],
+        kwargs_dump: np.ndarray,
+    ) -> None:
+        (alm_real,) = args
+        ducc0.sht.synthesis(
+            alm=alm_real.view(np.complex128),
+            map=out[0],
+            **geo,
+            lmax=lmax,
+            mmax=lmax,
+            spin=spin,
+            nthreads=nthreads,
+        )
+
+    def _adjoint_synthesis(
+        out: tuple[np.ndarray, ...],
+        args: tuple[np.ndarray, ...],
+        kwargs_dump: np.ndarray,
+    ) -> None:
+        (maps,) = args
+        ducc0.sht.adjoint_synthesis(
+            map=maps,
+            alm=out[0].view(np.complex128),
+            **geo,
+            lmax=lmax,
+            mmax=lmax,
+            spin=spin,
+            nthreads=nthreads,
+        )
+        out[0][..., m0_end:] *= 2.0
+
+    def _synthesis_abstract(
+        *args: np.ndarray, **kwargs: object
+    ) -> tuple[tuple[tuple[int, ...], np.dtype], ...]:
+        (alm_real,) = args
+        return ((alm_real.shape[:-1] + (n_pix,), alm_real.dtype),)
+
+    def _adjoint_synthesis_abstract(
+        *args: np.ndarray, **kwargs: object
+    ) -> tuple[tuple[tuple[int, ...], np.dtype], ...]:
+        (maps,) = args
+        return ((maps.shape[:-1] + (n_real,), maps.dtype),)
+
+    fwd = get_linear_call(
+        _synthesis,
+        _adjoint_synthesis,
+        _synthesis_abstract,
+        _adjoint_synthesis_abstract,
+    )
+    adj = get_linear_call(
+        _adjoint_synthesis,
+        _synthesis,
+        _adjoint_synthesis_abstract,
+        _synthesis_abstract,
+    )
+    return fwd, adj
+
+
+@lru_cache(maxsize=4)
+def _map2alm_scale(lmax: int, n_pix: int) -> np.ndarray:
+    """Per-real-DOF rescaling that turns the adjoint's output into `map2alm`'s.
 
     Parameters
     ----------
     lmax : int
         Maximum multipole.
+    n_pix : int
+        Number of map pixels, for the 4π/n_pix normalization.
 
     Returns
     -------
     np.ndarray
-        m-index per alm coefficient, as a plain numpy array so it is
-        safe to close over inside jax.pure_callback and jax.jit (a jnp
-        array would capture a tracer on first call and break reuse
-        across different trace contexts).
+        Shape (2 * n_alm,), interleaved to match the real-packed alm
+        layout. Undoes the primitive's 2x on m>0 and applies the
+        4π/n_pix normalization, so the result matches
+        `healpy.map2alm(..., use_pixel_weights=True)`.
     """
-    _, ms = hp.Alm.getlm(lmax)
-    return ms
+    ms = hp.Alm.getlm(lmax)[1]
+    return np.repeat(np.where(ms == 0, 1.0, 0.5) * (4.0 * np.pi / n_pix), 2)
 
 
-@lru_cache(maxsize=4)
-def _healpix_geo(nside: int) -> dict:
-    """HEALPix ring geometry for ducc0, cached per nside. Unpack with **geo."""
-    geo = ducc0.healpix.Healpix_Base(nside, "RING").sht_info()
-    return {k: geo[k] for k in ("theta", "phi0", "nphi", "ringstart")}
+def _to_real(alms: jnp.ndarray) -> jnp.ndarray:
+    """Interleave complex alm (..., n_alm) into real DOFs (..., 2 * n_alm)."""
+    stacked = jnp.stack([alms.real, alms.imag], axis=-1)
+    return stacked.reshape(alms.shape[:-1] + (2 * alms.shape[-1],))
 
 
-# ── inner layer: bare linear callbacks, forward-mode capable ──────────────────
-#
-# JVP of a linear map L: d/dε L(x + ε v)|_{ε=0} = L(v).
-# vmap_method='sequential' is required: jax.hessian vmaps internally over
-# Hessian basis directions, and pure_callback requires an explicit vmap_method.
-# Reverse-mode flow never reaches these primitives — it is fully handled by the
-# custom_vjp wrappers below.
-
-
-@partial(jax.custom_jvp, nondiff_argnums=(1, 2, 3))
-def _synthesis(alms: jnp.ndarray, nside: int, lmax: int, spin: int) -> jnp.ndarray:
-    """Bare synthesis SHT (harmonic coefficients to a map).
-
-    Parameters
-    ----------
-    alms : jnp.ndarray
-        Complex harmonic coefficients, shape (Nbins, ncomp, n_alm).
-    nside : int
-        HEALPix resolution (Python int, not a traced value).
-    lmax : int
-        Maximum multipole (Python int, not a traced value).
-    spin : int
-        Spin of the transform (0 or 2).
-
-    Returns
-    -------
-    jnp.ndarray
-        Real-space map, shape (Nbins, ncomp, n_pix).
-    """
-    Nbins, ncomp = alms.shape[0], alms.shape[1]
-    n_pix = hp.nside2npix(nside)
-    geo = _healpix_geo(nside)
-
-    def _cb(a: np.ndarray) -> np.ndarray:
-        return ducc0.sht.synthesis(
-            alm=np.asarray(a, dtype=np.complex128),
-            **geo,
-            lmax=lmax,
-            mmax=lmax,
-            spin=spin,
-            nthreads=0,
-        )
-
-    return jax.pure_callback(
-        _cb,
-        jax.ShapeDtypeStruct((Nbins, ncomp, n_pix), jnp.float64),
-        alms,
-        vmap_method="sequential",
-    )
-
-
-@_synthesis.defjvp
-def _synthesis_jvp(
-    nside: int,
-    lmax: int,
-    spin: int,
-    primals: tuple[jnp.ndarray],
-    tangents: tuple[jnp.ndarray],
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """JVP rule for `_synthesis`: since it's linear, applies the same transform to the tangent.
-
-    Parameters
-    ----------
-    nside, lmax, spin : int
-        Non-differentiable args, forwarded to `_synthesis`.
-    primals : tuple[jnp.ndarray]
-        `(alms,)`, the primal input.
-    tangents : tuple[jnp.ndarray]
-        `(dalms,)`, the tangent to push forward.
-
-    Returns
-    -------
-    tuple[jnp.ndarray, jnp.ndarray]
-        `(primal_out, tangent_out)`, both computed via `_synthesis`.
-    """
-    (alms,), (dalms,) = primals, tangents
-    return (_synthesis(alms, nside, lmax, spin), _synthesis(dalms, nside, lmax, spin))
-
-
-@partial(jax.custom_jvp, nondiff_argnums=(1, 2, 3))
-def _adjoint_synthesis(
-    maps: jnp.ndarray, nside: int, lmax: int, spin: int
-) -> jnp.ndarray:
-    """Bare adjoint-synthesis SHT (a map to harmonic coefficients).
-
-    No pixel weights or normalization — those are applied in JAX-space
-    by the callers so they are differentiated natively.
-
-    Parameters
-    ----------
-    maps : jnp.ndarray
-        Real-space map, shape (Nbins, ncomp, n_pix).
-    nside : int
-        HEALPix resolution (Python int, not a traced value).
-    lmax : int
-        Maximum multipole (Python int, not a traced value).
-    spin : int
-        Spin of the transform (0 or 2).
-
-    Returns
-    -------
-    jnp.ndarray
-        Complex harmonic coefficients, shape (Nbins, ncomp, n_alm).
-    """
-    Nbins, ncomp = maps.shape[0], maps.shape[1]
-    n_alm = hp.Alm.getsize(lmax)
-    geo = _healpix_geo(nside)
-
-    def _cb(g: np.ndarray) -> np.ndarray:
-        return ducc0.sht.adjoint_synthesis(
-            map=np.asarray(g, dtype=np.float64),
-            **geo,
-            lmax=lmax,
-            mmax=lmax,
-            spin=spin,
-            nthreads=0,
-        )
-
-    return jax.pure_callback(
-        _cb,
-        jax.ShapeDtypeStruct((Nbins, ncomp, n_alm), jnp.complex128),
-        maps,
-        vmap_method="sequential",
-    )
-
-
-@_adjoint_synthesis.defjvp
-def _adjoint_synthesis_jvp(
-    nside: int,
-    lmax: int,
-    spin: int,
-    primals: tuple[jnp.ndarray],
-    tangents: tuple[jnp.ndarray],
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """JVP rule for `_adjoint_synthesis`: since it's linear, applies the same transform to the tangent.
-
-    Parameters
-    ----------
-    nside, lmax, spin : int
-        Non-differentiable args, forwarded to `_adjoint_synthesis`.
-    primals : tuple[jnp.ndarray]
-        `(maps,)`, the primal input.
-    tangents : tuple[jnp.ndarray]
-        `(dmaps,)`, the tangent to push forward.
-
-    Returns
-    -------
-    tuple[jnp.ndarray, jnp.ndarray]
-        `(primal_out, tangent_out)`, both computed via `_adjoint_synthesis`.
-    """
-    (maps,), (dmaps,) = primals, tangents
-    return (
-        _adjoint_synthesis(maps, nside, lmax, spin),
-        _adjoint_synthesis(dmaps, nside, lmax, spin),
-    )
-
-
-# ── outer layer: validated adjoints via custom_vjp ────────────────────────────
-#
-# _fwd functions call the inner custom_jvp primitives (not the outer custom_vjp
-# functions), so that jacfwd can apply JVP through them.
-
-
-@partial(jax.custom_vjp, nondiff_argnums=(1, 2, 3))
-def _alm2map(alms: jnp.ndarray, nside: int, lmax: int, spin: int) -> jnp.ndarray:
-    """Synthesis SHT, with a validated custom_vjp for reverse-mode differentiation.
-
-    Parameters
-    ----------
-    alms : jnp.ndarray
-        Complex harmonic coefficients, shape (Nbins, ncomp, n_alm).
-    nside : int
-        HEALPix resolution.
-    lmax : int
-        Maximum multipole.
-    spin : int
-        Spin of the transform (0 or 2).
-
-    Returns
-    -------
-    jnp.ndarray
-        Real-space map, shape (Nbins, ncomp, n_pix).
-    """
-    return _synthesis(alms, nside, lmax, spin)
-
-
-def _alm2map_fwd(
-    alms: jnp.ndarray, nside: int, lmax: int, spin: int
-) -> tuple[jnp.ndarray, tuple[()]]:
-    """Forward pass for `_alm2map`'s custom_vjp: computes the output, no residuals needed.
-
-    Calls `_synthesis` (the inner custom_jvp primitive, not `_alm2map`
-    itself) so that `jacfwd` can still apply its own JVP rule through
-    this path.
-
-    Parameters
-    ----------
-    alms : jnp.ndarray
-        Complex harmonic coefficients.
-    nside, lmax, spin : int
-        Forwarded to `_synthesis`.
-
-    Returns
-    -------
-    tuple[jnp.ndarray, tuple[()]]
-        `(output, residuals)`; residuals are empty since `_alm2map_bwd`
-        doesn't need anything from the forward pass.
-    """
-    return _synthesis(alms, nside, lmax, spin), ()
-
-
-def _alm2map_bwd(
-    nside: int, lmax: int, spin: int, _: tuple[()], g_maps: jnp.ndarray
-) -> tuple[jnp.ndarray]:
-    """Backward pass (VJP) for `_alm2map`'s custom_vjp.
-
-    Parameters
-    ----------
-    nside, lmax, spin : int
-        Non-differentiable args.
-    _ : tuple[()]
-        Unused; the (empty) residuals from `_alm2map_fwd`.
-    g_maps : jnp.ndarray
-        Incoming cotangent (gradient w.r.t. the output map).
-
-    Returns
-    -------
-    tuple[jnp.ndarray]
-        `(g_alms,)`, the cotangent w.r.t. the input `alms`.
-
-    Notes
-    -----
-    VJP of synthesis: `adjoint_synthesis(g_maps)`, then double m>0 modes
-    to account for conjugate-symmetry (each m>0 coefficient appears once
-    in the stored alm but contributes to both +m and -m in the full
-    sum).
-    """
-    ms = get_ms(lmax)
-    g_alm = _adjoint_synthesis(g_maps, nside, lmax, spin)
-    return (jnp.conj(jnp.where(ms == 0, g_alm, 2.0 * g_alm)),)
-
-
-_alm2map.defvjp(_alm2map_fwd, _alm2map_bwd)
-
-
-@partial(jax.custom_vjp, nondiff_argnums=(1, 2))
-def _map2alm(maps: jnp.ndarray, lmax: int, spin: int) -> jnp.ndarray:
-    """Adjoint synthesis SHT, with pixel weights and a validated custom_vjp.
-
-    Applies full pixel weights and (4π/n_pix) normalization, matching
-    healpy.map2alm with use_pixel_weights=True. Weights are applied in
-    JAX-space so that _adjoint_synthesis stays a bare reusable primitive.
-
-    Parameters
-    ----------
-    maps : jnp.ndarray
-        Real-space map, shape (Nbins, ncomp, n_pix).
-    lmax : int
-        Maximum multipole.
-    spin : int
-        Spin of the transform (0 or 2).
-
-    Returns
-    -------
-    jnp.ndarray
-        Complex harmonic coefficients, shape (Nbins, ncomp, n_alm).
-    """
-    n_pix = maps.shape[-1]
-    nside = hp.npix2nside(n_pix)
-    w = get_pixel_weights(nside)
-    return _adjoint_synthesis(w * maps, nside, lmax, spin) * (4.0 * jnp.pi / n_pix)
-
-
-def _map2alm_fwd(
-    maps: jnp.ndarray, lmax: int, spin: int
-) -> tuple[jnp.ndarray, tuple[int]]:
-    """Forward pass for `_map2alm`'s custom_vjp: computes the output, saving `n_pix` as a residual.
-
-    Calls `_adjoint_synthesis` (the inner custom_jvp primitive, not
-    `_map2alm` itself) so that `jacfwd` can still apply its own JVP rule
-    through this path.
-
-    Parameters
-    ----------
-    maps : jnp.ndarray
-        Real-space map.
-    lmax, spin : int
-        Forwarded to `_adjoint_synthesis`.
-
-    Returns
-    -------
-    tuple[jnp.ndarray, tuple[int]]
-        `(output, (n_pix,))`; `n_pix` lets `_map2alm_bwd` recompute
-        `nside` and the pixel weights without needing to save the full
-        weight map.
-    """
-    n_pix = maps.shape[-1]
-    nside = hp.npix2nside(n_pix)
-    w = get_pixel_weights(nside)
-    result = _adjoint_synthesis(w * maps, nside, lmax, spin) * (4.0 * jnp.pi / n_pix)
-    return result, (n_pix,)
-
-
-def _map2alm_bwd(
-    lmax: int, spin: int, res: tuple[int], g_alm: jnp.ndarray
-) -> tuple[jnp.ndarray]:
-    """Backward pass (VJP) for `_map2alm`'s custom_vjp.
-
-    Parameters
-    ----------
-    lmax, spin : int
-        Non-differentiable args.
-    res : tuple[int]
-        `(n_pix,)`, the residual from `_map2alm_fwd`.
-    g_alm : jnp.ndarray
-        Incoming cotangent (gradient w.r.t. the output alm).
-
-    Returns
-    -------
-    tuple[jnp.ndarray]
-        `(g_maps,)`, the cotangent w.r.t. the input `maps`.
-
-    Notes
-    -----
-    VJP of `(4π/n_pix) · adjoint_synthesis(w · maps)`: result is
-    `w · synthesis(g_alm') · (4π/n_pix)`, where `g_alm'` halves m>0
-    modes (inverse of the 2x doubling in `_alm2map_bwd`).
-    """
-    (n_pix,) = res
-    nside = hp.npix2nside(n_pix)
-    w = get_pixel_weights(nside)
-    ms = get_ms(lmax)
-    g_scaled = jnp.where(ms == 0, jnp.conj(g_alm), 0.5 * jnp.conj(g_alm))
-    return (w * _synthesis(g_scaled, nside, lmax, spin) * (4.0 * jnp.pi / n_pix),)
-
-
-_map2alm.defvjp(_map2alm_fwd, _map2alm_bwd)
+def _to_complex(v: jnp.ndarray) -> jnp.ndarray:
+    """De-interleave real DOFs (..., 2 * n_alm) into complex alm (..., n_alm)."""
+    pairs = v.reshape(v.shape[:-1] + (v.shape[-1] // 2, 2))
+    return jax.lax.complex(pairs[..., 0], pairs[..., 1])
 
 
 # ── public API ────────────────────────────────────────────────────────────────
 
 
-def alm2map(alms: jnp.ndarray, nside: int, lmax: int, spin: int = 0) -> jnp.ndarray:
+def alm2map(
+    alms: jnp.ndarray, nside: int, lmax: int, spin: int = 0, nthreads: int = 0
+) -> jnp.ndarray:
     """Synthesis SHT for all bins via ducc0.
 
     Parameters
@@ -493,6 +270,9 @@ def alm2map(alms: jnp.ndarray, nside: int, lmax: int, spin: int = 0) -> jnp.ndar
         Maximum multipole (Python int, not a traced value).
     spin : int, optional
         0 or 2, by default 0.
+    nthreads : int, optional
+        ducc0 thread count; 0 (default) means all available hardware
+        threads.
 
     Returns
     -------
@@ -503,11 +283,14 @@ def alm2map(alms: jnp.ndarray, nside: int, lmax: int, spin: int = 0) -> jnp.ndar
     squeeze = alms.ndim == 2
     if squeeze:
         alms = alms[:, np.newaxis, :]
-    out = _alm2map(alms, nside, lmax, spin)
+    fwd, _ = _sht_ops(int(nside), int(lmax), int(spin), int(nthreads))
+    (out,) = fwd(_to_real(alms))
     return out[:, 0, :] if squeeze else out
 
 
-def map2alm(maps: jnp.ndarray, lmax: int, spin: int = 0) -> jnp.ndarray:
+def map2alm(
+    maps: jnp.ndarray, lmax: int, spin: int = 0, nthreads: int = 0
+) -> jnp.ndarray:
     """Analysis SHT for all bins via ducc0 (adjoint synthesis with pixel weights).
 
     Applies full pixel weights and (4π/n_pix) normalization, matching
@@ -523,6 +306,9 @@ def map2alm(maps: jnp.ndarray, lmax: int, spin: int = 0) -> jnp.ndarray:
         Maximum multipole (Python int, not a traced value).
     spin : int, optional
         0 or 2, by default 0.
+    nthreads : int, optional
+        ducc0 thread count; 0 (default) means all available hardware
+        threads.
 
     Returns
     -------
@@ -533,5 +319,10 @@ def map2alm(maps: jnp.ndarray, lmax: int, spin: int = 0) -> jnp.ndarray:
     squeeze = maps.ndim == 2
     if squeeze:
         maps = maps[:, np.newaxis, :]
-    out = _map2alm(maps, lmax, spin)
+    n_pix = maps.shape[-1]
+    nside = hp.npix2nside(n_pix)
+    w = get_pixel_weights(nside)
+    _, adj = _sht_ops(int(nside), int(lmax), int(spin), int(nthreads))
+    (v,) = adj(w * maps)
+    out = _to_complex(v * _map2alm_scale(int(lmax), n_pix))
     return out[:, 0, :] if squeeze else out
