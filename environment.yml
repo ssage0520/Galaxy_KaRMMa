@@ -30,3 +30,5 @@ dependencies:
   - pip:
       # Required for blackjax.progress_bar(); not on conda-forge.
       - jax-tap>=0.3.0
+      # Required for the jaxbind-based SHT primitive in karmma.transforms; not on conda-forge.
+      - jaxbind>=1.3.1
