@@ -18,11 +18,11 @@ mcmc:
     sampler: mclmc
     infer_theta: true
     seed: null
-    n_samples: 1500
+    n_samples: 750
     frac_tune1: 0.1
-    frac_tune2: 0.1
-    frac_tune3: 0.1
+    frac_tune2: 0.8
+    frac_tune3: 0.1667
     l_factor: 0.4
     thinning_warmup: 5
-    thinning_sampling: 30
-    desired_energy_var: 0.0005
+    thinning_sampling: 20
+    desired_energy_var: 5.0e-8
