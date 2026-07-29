@@ -9,11 +9,7 @@ import jax.scipy.stats as jst
 import numpy as np
 from scipy.special import legendre_p_all, roots_legendre
 
-from karmma.structs import (
-    KarmmaPosition,
-    ThetaParams,
-    XlmParams,
-)
+from karmma.structs import KarmmaPosition, ThetaParams, XlmParams
 from karmma.transforms import alm2map, map2alm
 
 _INVGAMMA_ALPHA_R = 1.0  # TODO: expose in McmcConfig
@@ -29,10 +25,13 @@ class ForwardModel:
         Observed galaxy overdensity maps, shape (Nbins, npix).
     mask : np.ndarray
         Survey mask, shape (npix,); cast to bool.
-    alpha : np.ndarray
-        Shifted-lognormal shape parameter, per bin.
-    beta : np.ndarray
-        Shifted-lognormal scale parameter, per bin.
+    lbda : np.ndarray
+        Point-transform parameters, shape (gn_order, Nbins): rows (alpha,
+        beta) for gn_order=2 (shifted lognormal), or (a, b, c) for
+        gn_order=3. One column per tomographic bin.
+    gn_order : int
+        Point-transform order in use for this model — 2 or 3 — applied
+        uniformly across all bins (never mixed per-bin).
     CL : np.ndarray
         Target (physical, non-Gaussian) angular power spectra, shape
         (Nbins, Nbins, gen_lmax + 1); off-diagonal entries `CL[i, j]`
@@ -71,8 +70,8 @@ class ForwardModel:
         Pixel window function, indexed by multipole (length >= lmax + 1).
     CL_G : np.ndarray
         Gaussianized angular power spectra: the covariance of the
-        underlying Gaussian field whose shifted-lognormal transform
-        reproduces `CL`. Set by `compute_CL_G`.
+        underlying Gaussian field whose `gn_order`-transform reproduces
+        `CL`. Set by `compute_CL_G`.
     L_G : np.ndarray
         Per-multipole Cholesky factor of `CL_G`, used by `apply_CL_G` to
         correlate independent per-bin Gaussian `xlm` draws into the
@@ -91,8 +90,8 @@ class ForwardModel:
         dg_obs: np.ndarray,
         mask: np.ndarray,
         CL: np.ndarray,
-        alpha: np.ndarray,
-        beta: np.ndarray,
+        lbda: np.ndarray,
+        gn_order: int,
         N_bar: np.ndarray | None = None,
         infer_theta: bool = False,
         theta_fixed: ThetaParams | None = None,
@@ -103,12 +102,20 @@ class ForwardModel:
         self.dg_obs = dg_obs
         self.mask = mask.astype(bool)
 
-        self.alpha = alpha
-        self.beta = beta
+        if lbda.shape[0] != gn_order:
+            raise ValueError(
+                f"lbda has {lbda.shape[0]} rows, expected gn_order={gn_order}"
+            )
+        self.lbda = lbda
+        self.gn_order = gn_order
 
         self.CL = CL
 
         self.Nbins = dg_obs.shape[0]
+        if lbda.shape[1] != self.Nbins:
+            raise ValueError(
+                f"lbda has {lbda.shape[1]} columns, expected Nbins={self.Nbins}"
+            )
         self.Nside = hp.get_nside(self.dg_obs[0])
         self.pixel_size = float(hp.nside2resol(self.Nside))
         self.map_shape = dg_obs.shape
@@ -137,8 +144,75 @@ class ForwardModel:
         self._imag_idx = np.where((self.gen_ell > 1) & (self.gen_emm > 0))[0]
         self.n_modes = len(self._real_idx) + len(self._imag_idx)
 
+    @staticmethod
+    def _xi_NG_to_xi_G_g3(
+        params_i: np.ndarray,
+        params_j: np.ndarray,
+        xi_NG: np.ndarray,
+        n_iter: int = 50,
+        tol: float = 1e-13,
+    ) -> np.ndarray:
+        """Invert G3's closed-form `xi_NG(xi_G)` relation via vectorized Newton's method.
+
+        `xi_NG(xi_G) = norm_i*norm_j*(exp(K*xi_G) + L*xi_G + c_i+c_j+c_i*c_j) - 1`,
+        with `K = a_i*a_j`, `L = a_i*b_j + a_j*b_i + b_i*b_j`, `norm = 1/(1+c)`.
+
+        Parameters
+        ----------
+        params_i, params_j : np.ndarray
+            This bin pair's (a, b, c) transform parameters, shape (3,) each.
+        xi_NG : np.ndarray
+            Target non-Gaussian correlation values (one per multipole/quadrature node).
+        n_iter : int, optional
+            Maximum Newton iterations, by default 50.
+        tol : float, optional
+            Convergence tolerance on the max per-iteration update, by default 1e-13.
+
+        Returns
+        -------
+        np.ndarray
+            The Gaussianized correlation `xi_G`, same shape as `xi_NG`.
+
+        Raises
+        ------
+        ValueError
+            If `params_i`/`params_j` don't guarantee `xi_NG(xi_G)` is monotonic
+            over `xi_G in (-1, 1)` (`K*exp(-K) + L > 0`) — otherwise the
+            Newton solve could converge to the wrong root silently.
+        """
+        a_i, b_i, c_i = params_i
+        a_j, b_j, c_j = params_j
+        K = a_i * a_j
+        L = a_i * b_j + a_j * b_i + b_i * b_j
+        norm = (1.0 / (1.0 + c_i)) * (1.0 / (1.0 + c_j))
+        const = c_i + c_j + c_i * c_j
+
+        if not (K * np.exp(-K) + L > 0):
+            raise ValueError(
+                f"G3 params {params_i}, {params_j} do not guarantee a monotonic "
+                "xi_NG -> xi_G relation over xi_G in (-1, 1)."
+            )
+
+        xi_G = np.zeros_like(xi_NG, dtype=float)
+        for _ in range(n_iter):
+            F = norm * (np.exp(K * xi_G) + L * xi_G + const) - 1.0
+            dF = norm * (K * np.exp(K * xi_G) + L)
+            xi_G_new = np.clip(xi_G - (F - xi_NG) / dF, -0.999999, 0.999999)
+            if np.max(np.abs(xi_G_new - xi_G)) < tol:
+                xi_G = xi_G_new
+                break
+            xi_G = xi_G_new
+        return xi_G
+
     def _compute_CL_G_binpair(
-        self, i: int, j: int, ell_array: np.ndarray, P_ell: np.ndarray, w: np.ndarray
+        self,
+        i: int,
+        j: int,
+        ell_array: np.ndarray,
+        P_ell: np.ndarray,
+        w: np.ndarray,
+        newton_iter: int = 50,
+        newton_tol: float = 1e-13,
     ) -> np.ndarray:
         """Gaussianize the (i, j) bin-pair power spectrum `CL[i, j]` into `CL_G[i, j]`.
 
@@ -153,6 +227,9 @@ class ForwardModel:
             `mu`, shape (gen_lmax + 1, n_quad).
         w : np.ndarray
             Gauss-Legendre quadrature weights, shape (n_quad,).
+        newton_iter, newton_tol : int, float, optional
+            Forwarded to `_xi_NG_to_xi_G_g3` when `gn_order=3`; ignored
+            when `gn_order=2`. See `compute_CL_G`.
 
         Returns
         -------
@@ -164,14 +241,13 @@ class ForwardModel:
         -----
         Three steps, via Gauss-Legendre quadrature:
 
-        1. Forward Legendre transform: `CL[i, j]` (the target,
-           non-Gaussian power spectrum) to `xi_NG`, its real-space
-           angular correlation function, evaluated at the quadrature
-           nodes.
-        2. Gaussianize pointwise: `xi_G = log(1 + xi_NG / (beta_i *
-           beta_j)) / (alpha_i * alpha_j)`, the inverse of the
-           shifted-lognormal covariance relation implied by
-           `dm = beta * (exp(alpha * y) - 1)`.
+        1. Forward Legendre transform: `CL[i, j]` to `xi_NG`, its
+           real-space angular correlation function, evaluated at the
+           quadrature nodes.
+        2. Gaussianize pointwise: for `gn_order=2`, G2's exact closed-form
+           log relation; for `gn_order=3`, `_xi_NG_to_xi_G_g3` (closed-form
+           relation + Newton solve — see that method's docstring for why
+           not the Lambert-W route).
         3. Inverse Legendre transform: `xi_G` back to `CL_G[i, j]`.
 
         The monopole/dipole (l=0,1) are forced to ~0 (exactly 0
@@ -182,22 +258,41 @@ class ForwardModel:
         """
         weighted_CL = (2 * ell_array + 1) * self.CL[i, j]
         xi_NG = weighted_CL @ P_ell / (4 * np.pi)
-        xi_G = np.log(1 + xi_NG / (self.beta[i] * self.beta[j])) / (
-            self.alpha[i] * self.alpha[j]
-        )
+
+        params_i = self.lbda[:, i]
+        params_j = self.lbda[:, j]
+        if self.gn_order == 2:
+            alpha_i, beta_i = params_i
+            alpha_j, beta_j = params_j
+            xi_G = np.log(1 + xi_NG / (beta_i * beta_j)) / (alpha_i * alpha_j)
+        elif self.gn_order == 3:
+            xi_G = self._xi_NG_to_xi_G_g3(
+                params_i, params_j, xi_NG, n_iter=newton_iter, tol=newton_tol
+            )
+        else:
+            raise ValueError(f"Unknown gn_order: {self.gn_order}")
+
         weighted_xi_G = w * xi_G
         CL_G_ij = 2 * np.pi * (P_ell @ weighted_xi_G)
         CL_G_ij[:2] = 1e-20 if i == j else 0.0
         return CL_G_ij
 
-    def compute_CL_G(self, order: int = 2) -> None:
+    def compute_CL_G(
+        self, quad_order: int = 2, newton_iter: int = 50, newton_tol: float = 1e-13
+    ) -> None:
         """Gaussianize `CL` into `CL_G`, and Cholesky-factorize it into `L_G`.
 
         Parameters
         ----------
-        order : int, optional
+        quad_order : int, optional
             Gauss-Legendre quadrature order multiplier — uses
-            `order * gen_lmax` quadrature points, by default 2.
+            `quad_order * gen_lmax` quadrature points, by default 2.
+        newton_iter : int, optional
+            Maximum Newton iterations for the `gn_order=3` case, by
+            default 50. Ignored when `gn_order=2`.
+        newton_tol : float, optional
+            Newton convergence tolerance for the `gn_order=3` case, by
+            default 1e-13. Ignored when `gn_order=2`.
 
         Notes
         -----
@@ -206,14 +301,20 @@ class ForwardModel:
         symmetric in the bin indices. Sets `self.CL_G` and `self.L_G`
         (`CL_G`'s per-multipole Cholesky factor, used by `apply_CL_G`).
         """
-        mu, w = roots_legendre(order * self.gen_lmax)
+        mu, w = roots_legendre(quad_order * self.gen_lmax)
         ell_array = np.arange(self.gen_lmax + 1)
         P_ell = legendre_p_all(self.gen_lmax, mu).squeeze()
         self.CL_G = np.zeros_like(self.CL)
         for i in range(self.Nbins):
             for j in range(i + 1):
                 self.CL_G[i, j, :] = self._compute_CL_G_binpair(
-                    i, j, ell_array, P_ell, w
+                    i,
+                    j,
+                    ell_array,
+                    P_ell,
+                    w,
+                    newton_iter=newton_iter,
+                    newton_tol=newton_tol,
                 )
                 if i != j:
                     self.CL_G[j, i] = self.CL_G[i, j]
@@ -281,6 +382,46 @@ class ForwardModel:
         ylm_imag = jnp.where(self.gen_emm == 0, 0.0, ylm_imag)
         return ylm_real + 1j * ylm_imag
 
+    @staticmethod
+    def gn(x: jnp.ndarray, N: int, lbda: jnp.ndarray) -> jnp.ndarray:
+        """Evaluate the G_N point-transformation for all tomographic bins at once.
+
+        Parameters
+        ----------
+        x : jnp.ndarray
+            Standard-normal latent Gaussian field values, shape (Nbins, ...)
+            (e.g. one HEALPix map per bin).
+        N : int
+            Transformation order. Currently ``2``
+            (shifted lognormal) or ``3`` are supported.
+        lbda : jnp.ndarray
+            Transformation parameters, shape ``(N, Nbins)``: rows ``(alpha,
+            beta)`` for ``N=2``, or ``(a, b, c)`` for ``N=3``, one column per
+            bin.
+
+        Returns
+        -------
+        jnp.ndarray
+            Transformed field, same shape as `x`.
+
+        Raises
+        ------
+        ValueError
+            If `N` is not `2` or `3`.
+        """
+        if N == 2:
+            alpha, beta = lbda[..., jnp.newaxis]
+            return beta * jnp.exp(alpha * x - 0.5 * alpha**2) - beta
+
+        elif N == 3:
+            a, b, c = lbda[..., jnp.newaxis]
+            arg = jnp.exp(a * x - 0.5 * a**2) + b * x + c
+            norm = 1.0 / (1.0 + c)
+            return norm * arg - 1.0
+
+        else:
+            raise ValueError(f"Unknown model type: {N}")
+
     def x2deff(self, xlm: XlmParams, theta: ThetaParams) -> jnp.ndarray:
         """Forward-model `xlm` into the effective density field used for the likelihood.
 
@@ -313,9 +454,7 @@ class ForwardModel:
         ylm = self.apply_CL_G(xlm_full)
 
         ys = alm2map(ylm, self.Nside, self.gen_lmax)
-        dm = self.beta[:, None] * (
-            jnp.exp(self.alpha[:, None] * ys - 0.5 * self.alpha[:, None] ** 2) - 1
-        )
+        dm = self.gn(ys, self.gn_order, self.lbda)
         dm_lm = map2alm(dm, self.lmax)
         b_ell = jnp.exp(
             -0.5
@@ -345,18 +484,16 @@ class ForwardModel:
         -----
         Pipeline: `xlm` -> full harmonic array (`get_xlm`) -> correlated
         Gaussian field harmonics (`apply_CL_G`) -> Gaussian field map
-        `ys` (`alm2map`) -> shifted-lognormal transform to the density
-        contrast `dm = beta * (exp(alpha * ys - 0.5 * alpha^2) - 1)`
-        (the `-0.5 * alpha^2` term zeros its mean) -> back to harmonic
-        space (`map2alm`), pixel-window-filtered if set -> back to a map.
+        `ys` (`alm2map`) -> the configured `G_N` point transform (`gn`,
+        `self.gn_order`/`self.lbda`) to the density contrast `dm` -> back
+        to harmonic space (`map2alm`), pixel-window-filtered if set ->
+        back to a map.
         """
         xlm_full = self.get_xlm(xlm)
         ylm = self.apply_CL_G(xlm_full)
 
         ys = alm2map(ylm, self.Nside, self.gen_lmax)
-        dm = self.beta[:, None] * (
-            jnp.exp(self.alpha[:, None] * ys - 0.5 * self.alpha[:, None] ** 2) - 1
-        )
+        dm = self.gn(ys, self.gn_order, self.lbda)
         dm_lm = map2alm(dm, self.lmax)
         if self.pixwin is not None:
             dm_lm = dm_lm * self.pixwin[self.ell]
@@ -521,10 +658,6 @@ class ForwardModel:
         -------
         XlmParams
             Random draw, matching `log_prob`'s `N(0, 1)` prior on `xlm`.
-
-        TODO: pair this with a function that pushes a random `xlm` draw
-        through the forward model to generate a full mock/synthetic
-        `dg_obs` observation.
         """
         rk, ik = jax.random.split(key)
         return XlmParams(
@@ -536,3 +669,64 @@ class ForwardModel:
             ),
         )
 
+    def generate_mock_dg_obs(
+        self, xlm: XlmParams, theta: ThetaParams, key: jax.Array
+    ) -> jnp.ndarray:
+        """Generate a synthetic `dg_obs` realization from a given `xlm`/`theta`.
+
+        Parameters
+        ----------
+        xlm : XlmParams
+            Free harmonic coefficients (see `get_xlm`) — the latent truth
+            to generate a mock observation from.
+        theta : ThetaParams
+            Bias/nuisance parameters.
+        key : jax.Array
+            JAX PRNG key for the binomial draw.
+
+        Returns
+        -------
+        jnp.ndarray
+            Synthetic galaxy overdensity map, shape (Nbins, npix), in the
+            same `dg_obs = counts/N_bar - 1` convention `log_prob` expects.
+
+        Notes
+        -----
+        Pipeline: `xlm` -> `x2deff` -> `dm_to_binom_params` -> `(n, p)` ->
+        `jax.random.binomial(key, round(n), p)` (`n` is rounded since
+        `dm_to_binom_params` backs it out as `mean_Ng / p`, generally
+        non-integer) -> `counts / N_bar - 1`. Uses whichever `G_N`
+        transform (`self.gn_order`) this model is configured with
+        transparently, via `x2deff`.
+        """
+        deff = self.x2deff(xlm, theta)
+        n, p = self.dm_to_binom_params(deff, theta)
+        counts = jax.random.binomial(key, jnp.round(n), p)
+        return counts / self.N_bar[:, None] - 1.0
+
+    def make_random_mock(
+        self, key: jax.Array, theta: ThetaParams
+    ) -> tuple[XlmParams, jnp.ndarray]:
+        """Draw a random `xlm` and generate its corresponding synthetic `dg_obs`.
+
+        Parameters
+        ----------
+        key : jax.Array
+            JAX PRNG key; split internally into an `xlm`-draw key (see
+            `make_random_xlm`) and a binomial-draw key (see
+            `generate_mock_dg_obs`).
+        theta : ThetaParams
+            Bias/nuisance parameters.
+
+        Returns
+        -------
+        xlm : XlmParams
+            The randomly-drawn latent truth.
+        dg_obs : jnp.ndarray
+            Its corresponding synthetic galaxy overdensity map, shape
+            (Nbins, npix).
+        """
+        xlm_key, obs_key = jax.random.split(key)
+        xlm = self.make_random_xlm(xlm_key)
+        dg_obs = self.generate_mock_dg_obs(xlm, theta, obs_key)
+        return xlm, dg_obs

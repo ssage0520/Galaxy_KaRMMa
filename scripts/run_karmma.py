@@ -2,7 +2,7 @@
 
 Reads an analysis/IO/MCMC configuration from a YAML file, builds a
 `ForwardModel`, dispatches to the configured sampler backend, and writes
-posterior draws and sampler diagnostics to the config's `io_dir`.
+posterior draws and sampler diagnostics to the config's `output_dir`.
 
 Examples
 --------
@@ -41,12 +41,12 @@ model = ForwardModel(
     dg_obs=io.dg_obs,
     N_bar=io.N_bar,
     mask=io.mask,
-    CL=analysis.cl,
-    alpha=analysis.alpha,
-    beta=analysis.beta,
+    CL=io.cl,
+    lbda=analysis.lbda,
+    gn_order=analysis.gn_order,
     infer_theta=mcmc.infer_theta,
     theta_fixed=io.theta_fixed,
-    pixwin=analysis.pixwin,
+    pixwin=io.pixwin,
 )
 
 print(
@@ -97,9 +97,9 @@ else:
     raise ValueError(f"Unrecognized mcmc config type: {type(mcmc).__name__}")
 
 
-os.makedirs(io.io_dir, exist_ok=True)
+os.makedirs(io.output_dir, exist_ok=True)
 
-with h5.File(os.path.join(io.io_dir, "samples.h5"), "w") as f:
+with h5.File(os.path.join(io.output_dir, "samples.h5"), "w") as f:
     xlm_grp = f.create_group("xlm")
     xlm_grp.create_dataset("real", data=np.array(states.xlm.real))
     xlm_grp.create_dataset("imag", data=np.array(states.xlm.imag))
@@ -109,7 +109,7 @@ with h5.File(os.path.join(io.io_dir, "samples.h5"), "w") as f:
         for field in ThetaParams._fields:
             theta_grp.create_dataset(field, data=np.array(getattr(states.theta, field)))
 
-with h5.File(os.path.join(io.io_dir, "mcmc_metadata.h5"), "w") as f:
+with h5.File(os.path.join(io.output_dir, "mcmc_metadata.h5"), "w") as f:
     # run info
     f["seed"] = np.array(mcmc.seed)
 

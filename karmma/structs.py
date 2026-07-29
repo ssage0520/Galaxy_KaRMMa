@@ -205,7 +205,7 @@ class MclmcConfig(NamedTuple):
 
 
 class AnalysisConfig(NamedTuple):
-    """Configuration for the forward model's survey/statistics setup.
+    """Configuration for the forward model's point-transform/survey setup.
 
     Attributes
     ----------
@@ -213,25 +213,17 @@ class AnalysisConfig(NamedTuple):
         Number of tomographic bins.
     nside : int
         HEALPix resolution parameter.
-    alpha : np.ndarray
-        Shifted-lognormal shape parameter, per bin.
-    beta : np.ndarray
-        Shifted-lognormal scale parameter, per bin.
-    cl : np.ndarray
-        Target (physical, non-Gaussian) angular power spectra, shape
-        (Nbins, Nbins, gen_lmax + 1); off-diagonal entries `cl[i, j]`
-        (i != j) are cross-power spectra between bins i and j.
-    pixwin : np.ndarray or None
-        Pixel window function, indexed by multipole (length >= lmax + 1),
-        or `None` if not applied.
+    lbda : np.ndarray
+        Point-transform parameters, shape (gn_order, nbins): rows (alpha,
+        beta) for gn_order=2, or (a, b, c) for gn_order=3.
+    gn_order : int
+        Point-transform order — 2 or 3.
     """
 
     nbins: int
     nside: int
-    alpha: np.ndarray
-    beta: np.ndarray
-    cl: np.ndarray
-    pixwin: np.ndarray | None
+    lbda: np.ndarray
+    gn_order: int
 
 
 class IoConfig(NamedTuple):
@@ -239,10 +231,13 @@ class IoConfig(NamedTuple):
 
     Attributes
     ----------
-    datafile : str
-        Path to the input HDF5 datafile.
-    io_dir : str
+    input_dir : str
+        Directory `datafile`/`init_file`/`theta_file`/`cl_file`/`pixwin`
+        are all resolved relative to.
+    output_dir : str
         Directory to write sampling output to.
+    datafile : str
+        Resolved path to the input HDF5 datafile.
     dg_obs : np.ndarray
         Observed galaxy overdensity maps, shape (Nbins, npix).
     mask : np.ndarray
@@ -250,16 +245,26 @@ class IoConfig(NamedTuple):
     N_bar : np.ndarray
         Average galaxy count per pixel, per bin — averaged across the
         full sky, not just the observed/masked region.
+    cl : np.ndarray
+        Target (physical, non-Gaussian) angular power spectra, shape
+        (Nbins, Nbins, gen_lmax + 1); off-diagonal entries `cl[i, j]`
+        (i != j) are cross-power spectra between bins i and j.
+    pixwin : np.ndarray or None
+        Pixel window function, indexed by multipole (length >= lmax + 1),
+        or `None` if not applied.
     initial_position : KarmmaPosition
         Starting position for sampling.
     theta_fixed : ThetaParams or None
         Fixed bias parameters; `None` when `infer_theta=True`.
     """
 
+    input_dir: str
+    output_dir: str
     datafile: str
-    io_dir: str
     dg_obs: np.ndarray
     mask: np.ndarray
     N_bar: np.ndarray
+    cl: np.ndarray
+    pixwin: np.ndarray | None
     initial_position: KarmmaPosition
     theta_fixed: ThetaParams | None

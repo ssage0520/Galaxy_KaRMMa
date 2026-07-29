@@ -2,7 +2,7 @@
 
 Computes each requested summary statistic for both the true `dm` map and
 every posterior sample in `samples.h5`, then writes the results to
-`summary_statistics.h5` in the config's `io_dir`.
+`summary_statistics.h5` in the config's `output_dir`.
 
 Examples
 --------
@@ -67,10 +67,10 @@ recompute_1pt = "1pt" in args.recompute
 nside = analysis.nside
 nbins = analysis.nbins
 mask = io.mask
-io_dir = io.io_dir
+output_dir = io.output_dir
 n_samples = mcmc.n_samples
 
-summary_file = os.path.join(io_dir, "summary_statistics.h5")
+summary_file = os.path.join(output_dir, "summary_statistics.h5")
 
 print("Loading true dm maps.")
 with h5.File(io.datafile, "r") as f:
@@ -102,7 +102,7 @@ if recompute_1pt:
     pdf_log_samples = np.zeros((n_samples, nbins, log_bins.shape[1] - 1))
 
 print("Computing summary statistics for samples.")
-with h5.File(os.path.join(io_dir, "samples.h5"), "r") as f:
+with h5.File(os.path.join(output_dir, "samples.h5"), "r") as f:
     for i in trange(n_samples):
         dm_i = f["dm"][i]
 

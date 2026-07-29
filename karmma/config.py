@@ -1,5 +1,7 @@
 """Loads and validates a KaRMMa run configuration from a YAML file."""
 
+import os
+
 import h5py as h5
 import healpy as hp
 import jax
@@ -52,14 +54,14 @@ class KarmmaConfig:
         Sampler configuration — which one depends on the config's
         `mcmc.sampler` key ("nuts" or "mclmc", default "mclmc").
     analysis : AnalysisConfig
-        Survey/statistics setup: number of tomographic bins, HEALPix
-        resolution, shifted-lognormal shape/scale parameters, angular
-        power spectra, and pixel window function.
+        Point-transform/survey setup: number of tomographic bins, HEALPix
+        resolution, and the `G_N` point-transform parameters/order.
     io : IoConfig
         Input/output configuration: data paths, the observed maps and
-        mask loaded from `datafile`, and the resolved initial sampling
-        position (from an init file, truth in the mock, or left `None`
-        for random initialization).
+        mask loaded from `datafile`, the target power spectrum and pixel
+        window, and the resolved initial sampling position (from an init
+        file, truth in the mock, or left `None` for random
+        initialization).
     """
 
     def __init__(self, config_file: str) -> None:
@@ -67,42 +69,67 @@ class KarmmaConfig:
             config = yaml.safe_load(f)
         self.mcmc = self._set_mcmc(config["mcmc"])
         self.analysis = self._set_analysis(config["analysis"])
-        self.io = self._set_io(config["io"])
+        self.io = self._set_io(config["io"], nside=self.analysis.nside)
 
     def _set_analysis(self, cfg: dict) -> AnalysisConfig:
         """Build an `AnalysisConfig` from the `analysis` config section."""
         nbins = int(cfg["nbins"])
         nside = int(cfg["nside"])
-        alpha = np.asarray(cfg["alpha"].split(","), dtype=float)
-        beta = np.asarray(cfg["beta"].split(","), dtype=float)
-        cl = np.load(cfg["cl_file"])
+        lbda, gn_order = self._set_gn(cfg["gn"])
+        return AnalysisConfig(nbins=nbins, nside=nside, lbda=lbda, gn_order=gn_order)
 
-        # 3 options for pixwin: null, healpix, or a path to a .npy file
-        pixwin_cfg = cfg.get("pixwin")
-        if pixwin_cfg == "healpix":
-            pixwin = hp.sphtfunc.pixwin(nside, lmax=3 * nside - 1)
-            print("Pixel window: healpix")
-        elif pixwin_cfg is not None:
-            pixwin = np.load(pixwin_cfg)
-            print(f"Pixel window: empirical ({pixwin_cfg})")
+    def _set_gn(self, cfg: dict) -> tuple[np.ndarray, int]:
+        """Build `(lbda, gn_order)` from the `analysis.gn` config section.
+
+        Parameters
+        ----------
+        cfg : dict
+            The `analysis.gn` section — either `{alpha, beta}` (G2) or
+            `{a, b, c}` (G3), each a comma-separated per-bin string.
+
+        Returns
+        -------
+        lbda : np.ndarray
+            Shape (gn_order, Nbins), rows in the order `ForwardModel.gn`
+            expects: (alpha, beta) for gn_order=2, (a, b, c) for gn_order=3.
+        gn_order : int
+            2 or 3, inferred from which keys are present.
+
+        Raises
+        ------
+        ValueError
+            If `cfg` doesn't contain exactly one of the two supported key sets.
+        """
+        is_g2 = {"alpha", "beta"} <= cfg.keys()
+        is_g3 = {"a", "b", "c"} <= cfg.keys()
+        if is_g2 and not is_g3:
+            keys, gn_order = ("alpha", "beta"), 2
+        elif is_g3 and not is_g2:
+            keys, gn_order = ("a", "b", "c"), 3
         else:
-            pixwin = None
-            print("Pixel window: none (warning: this may bias your results)")
+            raise ValueError(
+                "analysis.gn must contain exactly one of {alpha, beta} (G2) or "
+                "{a, b, c} (G3)."
+            )
+        lbda = np.array([np.asarray(cfg[k].split(","), dtype=float) for k in keys])
+        return lbda, gn_order
 
-        return AnalysisConfig(
-            nbins=nbins, nside=nside, alpha=alpha, beta=beta, cl=cl, pixwin=pixwin
-        )
-
-    def _set_io(self, cfg: dict) -> IoConfig:
+    def _set_io(self, cfg: dict, nside: int) -> IoConfig:
         """Build an `IoConfig` from the `io` config section.
 
-        Loads the observed maps from `datafile`, then resolves `xlm`/`theta`
-        initial values by priority order (see Notes).
+        Loads the observed maps, target power spectrum, and pixel window
+        (`datafile`/`cl_file`/`pixwin`, all resolved relative to
+        `input_dir`), then resolves `xlm`/`theta` initial values by
+        priority order (see Notes).
 
         Parameters
         ----------
         cfg : dict
             The `io` config section.
+        nside : int
+            HEALPix resolution, from `AnalysisConfig.nside` — needed only
+            if `pixwin: healpix` requests an analytically-computed pixel
+            window.
 
         Returns
         -------
@@ -141,15 +168,35 @@ class KarmmaConfig:
         fixed theta breaks it. This whole section needs reworking, likely
         removing `infer_theta` as an option entirely.
         """
-        datafile = cfg["datafile"]
-        io_dir = cfg["io_dir"]
-        init_file = cfg.get("init_file")  # None is the common case
-        theta_file = cfg.get("theta_file")
+        input_dir = cfg["input_dir"]
+        output_dir = cfg["output_dir"]
+
+        def _resolve(key):
+            value = cfg.get(key)
+            return os.path.join(input_dir, value) if value else None
+
+        datafile = _resolve("datafile")
+        init_file = _resolve("init_file")
+        theta_file = _resolve("theta_file")
 
         with h5.File(datafile, "r") as f:
             dg_obs = f["dg_obs"][:]
             mask = f["mask"][:].astype(bool)
             N_bar = f["N_bar"][:]
+
+        cl = np.load(_resolve("cl_file"))
+
+        # 3 options for pixwin: null, healpix, or a filename (resolved via input_dir)
+        pixwin_cfg = cfg.get("pixwin")
+        if pixwin_cfg == "healpix":
+            pixwin = hp.sphtfunc.pixwin(nside, lmax=3 * nside - 1)
+            print("Pixel window: healpix")
+        elif pixwin_cfg is not None:
+            pixwin = np.load(_resolve("pixwin"))
+            print(f"Pixel window: empirical ({pixwin_cfg})")
+        else:
+            pixwin = None
+            print("Pixel window: none (warning: this may bias your results)")
 
         # --- xlm (priority order) ---
         # `init_file and ...` short-circuits safely when init_file is None
@@ -194,11 +241,14 @@ class KarmmaConfig:
             theta_fixed = theta
 
         return IoConfig(
+            input_dir=input_dir,
+            output_dir=output_dir,
             datafile=datafile,
-            io_dir=io_dir,
             dg_obs=dg_obs,
             mask=mask,
             N_bar=N_bar,
+            cl=cl,
+            pixwin=pixwin,
             initial_position=initial_position,
             theta_fixed=theta_fixed,
         )
