@@ -500,25 +500,34 @@ class ForwardModel:
         return alm2map(dm_lm, self.Nside, self.lmax)
 
     def dm_to_binom_params(
-        self, deff: jnp.ndarray, theta: ThetaParams
+        self, deff: jnp.ndarray, theta: ThetaParams, *, mask_output: bool = False
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Convert the effective density field into binomial (n, p) count parameters.
 
         Parameters
         ----------
         deff : jnp.ndarray
-            Effective density contrast, as returned by `x2deff`.
+            Effective density contrast over the full sky, shape
+            (Nbins, npix), as returned by `x2deff` — full-sky for either
+            `mask_output` setting.
         theta : ThetaParams
             Bias/nuisance parameters; uses `A_t`, `log_T` (detection
             threshold/sharpness) and `mu0`, `a` (variance-depletion
             offset/slope).
+        mask_output : bool, optional
+            Whether to return only the `mask` columns (True) or the full
+            sky (False), by default False. `log_prob`'s binomial
+            likelihood consumes the observed footprint alone, so
+            evaluating the full sky there spends ~8x the elementwise work
+            and ~8x the reverse-mode residuals on results it discards.
 
         Returns
         -------
         n : jnp.ndarray
-            Binomial number-of-trials parameter, per pixel per bin.
+            Binomial number-of-trials parameter, per bin per pixel; shape
+            (Nbins, npix), or (Nbins, mask.sum()) if `mask_output`.
         p : jnp.ndarray
-            Binomial success-probability parameter, per pixel per bin.
+            Binomial success-probability parameter, same shape as `n`.
 
         Notes
         -----
@@ -529,7 +538,11 @@ class ForwardModel:
         transition sharpness. `b` renormalizes the calibrated mean count
         (`mean_Ng = b * (1 + deff) * sig * N_bar`) so its sky average
         over the observed mask matches `N_bar`, given the current
-        `deff` realization.
+        `deff` realization. That average runs over the observed mask
+        under either `mask_output` setting, so `b` comes out the same
+        scalar per bin either way; given `b`, `n` and `p` are elementwise
+        in `deff`, making the `mask_output=True` result exactly the
+        `mask` columns of the `mask_output=False` one.
 
         A second mean count, `mean_Ng_prime`, is then computed at a
         density perturbed by `mu = mu0 + a * deff`. The difference
@@ -552,12 +565,17 @@ class ForwardModel:
         a = theta.a[:, np.newaxis]
         N_bar = self.N_bar[:, np.newaxis]
 
+        deff = deff[:, self.mask] if mask_output else deff
+
         A = jnp.log1p(deff)
         sig = jax.nn.sigmoid((A - A_t) / T)
 
-        deff_b = deff[:, self.mask]
-        sig_b = sig[:, self.mask]
-        b = 1.0 / jnp.mean((1 + deff_b) * sig_b, axis=1)
+        if mask_output:
+            b = 1.0 / jnp.mean((1 + deff) * sig, axis=1)
+        else:
+            deff_b = deff[:, self.mask]
+            sig_b = sig[:, self.mask]
+            b = 1.0 / jnp.mean((1 + deff_b) * sig_b, axis=1)
 
         mean_Ng = b[:, np.newaxis] * (1 + deff) * sig * N_bar
 
@@ -593,6 +611,10 @@ class ForwardModel:
         `xlm` has an i.i.d. `N(0, 1)` prior on both its real and
         imaginary free parameters.
 
+        The binomial term is evaluated on the observed footprint only
+        (`dm_to_binom_params(..., mask_output=True)`), matching
+        `Ng_obs`'s masked layout.
+
         When `infer_theta`, two additional terms are added:
 
         - `log_jacobian_theta`: `log_T`/`log_R` are sampled in
@@ -611,12 +633,9 @@ class ForwardModel:
 
         deff = self.x2deff(params.xlm, theta)
 
-        n, p = self.dm_to_binom_params(deff, theta)
+        n, p = self.dm_to_binom_params(deff, theta, mask_output=True)
 
-        n_m = n[:, self.mask]
-        p_m = p[:, self.mask]
-
-        log_lik = jnp.sum(jax.scipy.stats.binom.logpmf(self.Ng_obs, n_m, p_m))
+        log_lik = jnp.sum(jst.binom.logpmf(self.Ng_obs, n, p))
 
         log_prior_real = jnp.sum(jst.norm.logpdf(params.xlm.real, loc=0.0, scale=1.0))
         log_prior_imag = jnp.sum(jst.norm.logpdf(params.xlm.imag, loc=0.0, scale=1.0))
@@ -698,9 +717,16 @@ class ForwardModel:
         non-integer) -> `counts / N_bar - 1`. Uses whichever `G_N`
         transform (`self.gn_order`) this model is configured with
         transparently, via `x2deff`.
+
+        `(n, p)` are taken full-sky (`mask_output=False`) because the
+        mock is a HEALPix map: it gets written to disk and read back
+        through `KarmmaConfig`, whose `ForwardModel` reconstruction
+        infers `Nside` from its length. The shape also fixes how many
+        values the binomial consumes from `key`, so it sets the draw at
+        every pixel, footprint included.
         """
         deff = self.x2deff(xlm, theta)
-        n, p = self.dm_to_binom_params(deff, theta)
+        n, p = self.dm_to_binom_params(deff, theta, mask_output=False)
         counts = jax.random.binomial(key, jnp.round(n), p)
         return counts / self.N_bar[:, None] - 1.0
 
