@@ -71,13 +71,16 @@ class WhitenedKarmmaPosition(NamedTuple):
 
     Attributes
     ----------
-    xlm : XlmParams
-        Field coefficients (unchanged from `KarmmaPosition`).
+    xlm : XlmParams or None
+        Field coefficients (unchanged from `KarmmaPosition`). Always
+        concrete for a single "current position" (e.g. the sampling loop's
+        scan carry); `None` only in a stacked, returned sample trajectory
+        when the sampler was run with `save_xlm=False`.
     phi : jnp.ndarray
         Flat whitened bias parameters, shape (n_theta,).
     """
 
-    xlm: XlmParams
+    xlm: XlmParams | None
     phi: jnp.ndarray
 
 
@@ -245,6 +248,9 @@ class IoConfig(NamedTuple):
         or `None` if not applied.
     initial_position : KarmmaPosition
         Starting position for sampling.
+    save_maps : bool
+        Whether `xlm` is retained in memory during sampling and written to
+        `samples.h5`; `theta` is always saved regardless.
     """
 
     input_dir: str
@@ -256,3 +262,4 @@ class IoConfig(NamedTuple):
     cl: np.ndarray
     pixwin: np.ndarray | None
     initial_position: KarmmaPosition
+    save_maps: bool

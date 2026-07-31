@@ -80,6 +80,9 @@ class ForwardModel:
     n_modes : int
         Total number of free `xlm` parameters (`len(_real_idx) +
         len(_imag_idx)`).
+    n_real, n_imag : int
+        Per-bin count of free real/imaginary harmonic modes (`len(_real_idx)`,
+        `len(_imag_idx)`).
     """
 
     def __init__(
@@ -134,7 +137,9 @@ class ForwardModel:
         # so these static index constants are never confused with JAX tracers.
         self._real_idx = np.where(self.gen_ell > 1)[0]
         self._imag_idx = np.where((self.gen_ell > 1) & (self.gen_emm > 0))[0]
-        self.n_modes = len(self._real_idx) + len(self._imag_idx)
+        self.n_real = len(self._real_idx)
+        self.n_imag = len(self._imag_idx)
+        self.n_modes = self.n_real + self.n_imag
 
     @staticmethod
     def _xi_NG_to_xi_G_g3(

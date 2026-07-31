@@ -117,24 +117,26 @@ def load_run(output_dir: str, mock_dg_path: str, label: str, color: str) -> dict
         Run data. Keys present regardless of sampler type: `label`,
         `color`, `output_dir`, `type` ("nuts" or "mclmc"), `seed`,
         `step_size`, `inverse_mass_matrix`, `log_prob`, `theta_reparam`,
-        `xlm_real`, `xlm_imag`, `theta_samples`, `nbins`, `n_real`,
-        `n_imag`, `n_samples`, `true_theta`, `ess_xlm_real`,
-        `ess_xlm_imag`, `ess_theta`. `extra` holds whatever's specific to
-        the detected type (`NUTS_ONLY_KEYS` or `MCLMC_ONLY_KEYS`).
-        `mcmc_config` holds the full mcmc config dump (empty dict for
-        pre-refactor runs that predate that group existing).
+        `theta_samples`, `nbins`, `n_real`, `n_imag`, `n_samples`,
+        `true_theta`, `ess_theta`. `xlm_real`, `xlm_imag`, `ess_xlm_real`,
+        `ess_xlm_imag` are `None` for runs saved with `save_maps=False`
+        (no `xlm` group in `samples.h5`). `extra` holds whatever's
+        specific to the detected type (`NUTS_ONLY_KEYS` or
+        `MCLMC_ONLY_KEYS`). `mcmc_config` holds the full mcmc config dump
+        (empty dict for pre-refactor runs that predate that group
+        existing).
     """
     metadata_path = os.path.join(output_dir, "mcmc_metadata.h5")
     samples_path = os.path.join(output_dir, "samples.h5")
     run_type = detect_run_type(metadata_path)
 
     with h5.File(samples_path, "r") as f:
-        xlm_real = f["xlm/real"][:]
-        xlm_imag = f["xlm/imag"][:]
-        theta_samples = _read_theta_group(f, "theta") if "theta" in f else None
+        has_xlm = "xlm" in f
+        xlm_real = f["xlm/real"][:] if has_xlm else None
+        xlm_imag = f["xlm/imag"][:] if has_xlm else None
+        theta_samples = _read_theta_group(f, "theta")
 
-    n_samples, nbins, n_real = xlm_real.shape
-    n_imag = xlm_imag.shape[-1]
+    n_samples = theta_samples.shape[0]
 
     with h5.File(metadata_path, "r") as f:
         seed = f["seed"][()]
@@ -155,17 +157,20 @@ def load_run(output_dir: str, mock_dg_path: str, label: str, color: str) -> dict
             if "mcmc_config" in f
             else {}
         )
+        nbins = int(f["model_shape/nbins"][()])
+        n_real = int(f["model_shape/n_real"][()])
+        n_imag = int(f["model_shape/n_imag"][()])
 
     with h5.File(mock_dg_path, "r") as f:
         true_theta = _read_theta_group(f, "true_theta")  # (nbins, 6)
 
-    ess_xlm_real = np.array(effective_sample_size(xlm_real[np.newaxis]))
-    ess_xlm_imag = np.array(effective_sample_size(xlm_imag[np.newaxis]))
-    ess_theta = (
-        np.array(effective_sample_size(theta_samples[np.newaxis]))
-        if theta_samples is not None
-        else None
+    ess_xlm_real = (
+        np.array(effective_sample_size(xlm_real[np.newaxis])) if has_xlm else None
     )
+    ess_xlm_imag = (
+        np.array(effective_sample_size(xlm_imag[np.newaxis])) if has_xlm else None
+    )
+    ess_theta = np.array(effective_sample_size(theta_samples[np.newaxis]))
 
     return {
         "label": label,

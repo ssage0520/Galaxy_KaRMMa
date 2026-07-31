@@ -159,9 +159,14 @@ class KarmmaConfig:
         before the priority chain runs, rather than being silently
         bounced to `true_theta`/`theta_file` — resuming from a partial
         init file is far more likely to be a mistake than an intent.
+
+        `save_maps` (default `True`) controls whether `xlm` is retained
+        during sampling and saved to `samples.h5`; `theta` is always saved.
         """
         input_dir = cfg["input_dir"]
         output_dir = cfg["output_dir"]
+        save_maps = bool(cfg.get("save_maps", True))
+        print(f"save_maps: {save_maps}")
 
         def _resolve(key):
             value = cfg.get(key)
@@ -235,6 +240,7 @@ class KarmmaConfig:
             cl=cl,
             pixwin=pixwin,
             initial_position=initial_position,
+            save_maps=save_maps,
         )
 
     def _resolve_seed_and_key(self, cfg: dict) -> tuple[int, jax.Array]:
