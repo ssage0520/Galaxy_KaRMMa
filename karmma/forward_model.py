@@ -1,5 +1,7 @@
 """Forward model: xlm harmonic coefficients to galaxy counts, and the posterior log-density."""
 
+import functools
+
 import healpy as hp
 import jax
 
@@ -674,6 +676,62 @@ class ForwardModel:
             ),
         )
 
+    @staticmethod
+    @functools.partial(jax.jit, static_argnums=(3,))
+    def _inverse_cdf_scan(
+        n: jnp.ndarray, p: jnp.ndarray, u: jnp.ndarray, kmax: int
+    ) -> jnp.ndarray:
+        """Inverse-CDF sample the continuous-`n` binomial pmf, streamed via `fori_loop`.
+
+        Parameters
+        ----------
+        n, p : jnp.ndarray
+            Continuous binomial parameters, same shape (e.g. (Nbins, npix)).
+        u : jnp.ndarray
+            `Uniform(0, 1)` draws, same shape as `n`.
+        kmax : int
+            Largest count evaluated; static, since it sets the scan length.
+
+        Returns
+        -------
+        jnp.ndarray
+            Sampled counts, same shape as `n`.
+
+        Notes
+        -----
+        Builds the pmf via its exact ratio recursion rather than
+        evaluating `jax.scipy.stats.binom.logpmf` at every `k`, so a full
+        `(Nbins, npix, kmax)` table is never materialized.
+
+        For non-integer `n`, `k = ceil(n)` is provably the last point with
+        nonzero probability (the generalized binomial coefficient goes
+        negative just past it), independent of `p` — so `kmax` only needs
+        a margin for floating-point safety, not real tail allowance.
+
+        Known limitation: `(1-p)**n` can underflow to exactly `0.0` for
+        `p` near 1 and `n` upward of ~50, after which the recursion can't
+        recover. Not an issue in this model's actual regime (checked:
+        `n * -log1p(-p)` stays far below float64's ~745 underflow limit).
+        """
+        odds = p / (1.0 - p)
+        w = jnp.power(1.0 - p, n)  # pmf(0)
+        S = w
+        counts = (u > S).astype(jnp.int32)
+
+        def body(
+            k: jnp.ndarray, carry: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+        ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+            """One recursion step: advance the pmf weight/running sum, and the count comparison."""
+            w, S, counts = carry
+            num = n - k + 1.0
+            ratio = jnp.where(num >= 0.0, num / k * odds, 0.0)
+            w = w * ratio
+            S = S + w
+            return (w, S, counts + (u > S).astype(jnp.int32))
+
+        _, _, counts = jax.lax.fori_loop(1, kmax + 1, body, (w, S, counts))
+        return counts.astype(jnp.float64)
+
     def generate_mock_dg_obs(
         self, xlm: XlmParams, theta: ThetaParams, key: jax.Array
     ) -> jnp.ndarray:
@@ -687,7 +745,7 @@ class ForwardModel:
         theta : ThetaParams
             Bias/nuisance parameters.
         key : jax.Array
-            JAX PRNG key for the binomial draw.
+            JAX PRNG key for the count draw.
 
         Returns
         -------
@@ -697,23 +755,19 @@ class ForwardModel:
 
         Notes
         -----
-        Pipeline: `xlm` -> `x2deff` -> `dm_to_binom_params` -> `(n, p)` ->
-        `jax.random.binomial(key, round(n), p)` (`n` is rounded since
-        `dm_to_binom_params` backs it out as `mean_Ng / p`, generally
-        non-integer) -> `counts / N_bar - 1`. Uses whichever `G_N`
-        transform (`self.gn_order`) this model is configured with
-        transparently, via `x2deff`.
+        Counts are drawn by exact inverse-CDF sampling from the same
+        continuous-`n` pmf `log_prob` uses (`_inverse_cdf_scan`), not by
+        rounding `n` first — rounding would sample from a distribution
+        other than the one the likelihood assumes, biasing recovery.
 
-        `(n, p)` are taken full-sky (`mask_output=False`) because the
-        mock is a HEALPix map: it gets written to disk and read back
-        through `KarmmaConfig`, whose `ForwardModel` reconstruction
-        infers `Nside` from its length. The shape also fixes how many
-        values the binomial consumes from `key`, so it sets the draw at
-        every pixel, footprint included.
+        `(n, p)` are full-sky (`mask_output=False`): the mock is a
+        complete HEALPix map, written to disk and read back for `Nside`.
         """
         deff = self.x2deff(xlm, theta)
         n, p = self.dm_to_binom_params(deff, theta, mask_output=False)
-        counts = jax.random.binomial(key, jnp.round(n), p)
+        kmax = int(np.ceil(float(jnp.max(n)))) + 1
+        u = jax.random.uniform(key, shape=n.shape, dtype=jnp.float64)
+        counts = self._inverse_cdf_scan(n, p, u, kmax)
         return counts / self.N_bar[:, None] - 1.0
 
     def make_random_mock(
