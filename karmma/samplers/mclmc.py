@@ -12,7 +12,7 @@ from blackjax.adaptation.mclmc_adaptation import MCLMCAdaptationState
 from blackjax.mcmc.mclmc import MCLMCInfo as RawMCLMCInfo
 
 from karmma.samplers.base import WhitenedSampler
-from karmma.structs import KarmmaPosition, MCLMCInfo
+from karmma.structs import KarmmaPosition, MCLMCInfo, WhitenedKarmmaPosition
 
 
 class MCLMCSampler(WhitenedSampler):
@@ -31,6 +31,7 @@ class MCLMCSampler(WhitenedSampler):
         desired_energy_var: float = 5e-4,
         thinning_warmup: int = 5,
         thinning_sampling: int = 5,
+        save_xlm: bool = True,
     ) -> tuple[KarmmaPosition, MCLMCInfo, MCLMCAdaptationState]:
         """Run MCLMC, seeding its diagonal preconditioner from `initial_imm`.
 
@@ -68,11 +69,17 @@ class MCLMCSampler(WhitenedSampler):
             unthinned), by default 5.
         thinning_sampling : int, optional
             Thinning applied during the final sampling phase, by default 5.
+        save_xlm : bool, optional
+            Whether to retain the sampled `xlm` trajectory, by default True.
+            When False, `xlm` is never stacked across the sampling loop —
+            only the current step's `xlm` exists in memory, as part of the
+            scan carry — and `states.xlm` is `None` on return.
 
         Returns
         -------
         states : KarmmaPosition
-            Posterior samples (physical theta-space), batched over `num_samples`.
+            Posterior samples (physical theta-space), batched over
+            `num_samples`. `states.xlm` is `None` when `save_xlm=False`.
         infos : MCLMCInfo
             Per-sample MCLMC diagnostics (log density, energy change,
             non-NaN fraction), aggregated over each thinning block (see
@@ -269,7 +276,9 @@ class MCLMCSampler(WhitenedSampler):
                 num_steps=num_samples,
                 initial_state=tuned_state,
                 transform=lambda state, info: (
-                    state.position,
+                    state.position
+                    if save_xlm
+                    else WhitenedKarmmaPosition(xlm=None, phi=state.position.phi),
                     MCLMCInfo(
                         logdensity=info.logdensity,
                         energy_change=info.energy_change,

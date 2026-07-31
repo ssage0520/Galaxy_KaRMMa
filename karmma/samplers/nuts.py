@@ -10,7 +10,7 @@ import numpy as np
 from blackjax.adaptation.base import AdaptationInfo, get_filter_adapt_info_fn
 
 from karmma.samplers.base import WhitenedSampler
-from karmma.structs import KarmmaPosition, NUTSInfo
+from karmma.structs import KarmmaPosition, NUTSInfo, WhitenedKarmmaPosition
 
 
 class NUTSSampler(WhitenedSampler):
@@ -26,6 +26,7 @@ class NUTSSampler(WhitenedSampler):
         imm_shrinkage_to_previous: float = 0.0,
         step_size: float = 0.05,
         target_acceptance_rate: float = 0.65,
+        save_xlm: bool = True,
     ) -> tuple[KarmmaPosition, NUTSInfo, dict, AdaptationInfo]:
         """Run NUTS, seeding window adaptation's inverse mass matrix from `initial_imm`.
 
@@ -51,11 +52,17 @@ class NUTSSampler(WhitenedSampler):
             Initial step size for warmup, by default 0.05.
         target_acceptance_rate : float, optional
             Target acceptance rate for step-size adaptation, by default 0.65.
+        save_xlm : bool, optional
+            Whether to retain the sampled `xlm` trajectory, by default True.
+            When False, `xlm` is never stacked across the sampling loop —
+            only the current step's `xlm` exists in memory, as part of the
+            scan carry — and `states.xlm` is `None` on return.
 
         Returns
         -------
         states : KarmmaPosition
-            Posterior samples (physical theta-space), batched over `num_samples`.
+            Posterior samples (physical theta-space), batched over
+            `num_samples`. `states.xlm` is `None` when `save_xlm=False`.
         infos : NUTSInfo
             Per-sample NUTS diagnostics (divergences, integration steps,
             acceptance rate, energy, log density), batched over `num_samples`.
@@ -133,7 +140,9 @@ class NUTSSampler(WhitenedSampler):
                 num_steps=num_samples,
                 initial_state=wstate,
                 transform=lambda state, info: (
-                    state.position,
+                    state.position
+                    if save_xlm
+                    else WhitenedKarmmaPosition(xlm=None, phi=state.position.phi),
                     NUTSInfo(
                         is_divergent=info.is_divergent,
                         num_integration_steps=info.num_integration_steps,

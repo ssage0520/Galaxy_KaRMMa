@@ -1,5 +1,7 @@
 """Forward model: xlm harmonic coefficients to galaxy counts, and the posterior log-density."""
 
+import functools
+
 import healpy as hp
 import jax
 
@@ -44,17 +46,12 @@ class ForwardModel:
         Pixel angular size in radians (`hp.nside2resol(Nside)`).
     map_shape : tuple of int
         Shape of `dg_obs`.
-    infer_theta : bool
-        Whether `theta` is sampled jointly with `xlm` (True) or held
-        fixed at `theta_fixed` (False).
     N_bar : np.ndarray
         Average galaxy count per pixel, per bin — averaged across the
         full sky, not just the observed/masked region.
     Ng_obs : np.ndarray
         Observed galaxy counts per masked pixel, per bin —
         `(dg_obs[:, mask] + 1) * N_bar`, rounded to the nearest integer.
-    theta_fixed : ThetaParams or None
-        Fixed bias parameters; `None` unless `infer_theta=False`.
     lmax : int
         Maximum multipole of the output maps, by default `2 * Nside`.
     gen_lmax : int
@@ -83,6 +80,9 @@ class ForwardModel:
     n_modes : int
         Total number of free `xlm` parameters (`len(_real_idx) +
         len(_imag_idx)`).
+    n_real, n_imag : int
+        Per-bin count of free real/imaginary harmonic modes (`len(_real_idx)`,
+        `len(_imag_idx)`).
     """
 
     def __init__(
@@ -93,8 +93,6 @@ class ForwardModel:
         lbda: np.ndarray,
         gn_order: int,
         N_bar: np.ndarray | None = None,
-        infer_theta: bool = False,
-        theta_fixed: ThetaParams | None = None,
         lmax: int | None = None,
         gen_lmax: int | None = None,
         pixwin: np.ndarray | None = None,
@@ -120,14 +118,11 @@ class ForwardModel:
         self.pixel_size = float(hp.nside2resol(self.Nside))
         self.map_shape = dg_obs.shape
 
-        self.infer_theta = infer_theta
-
         self.N_bar = np.asarray(N_bar)
         self.Ng_obs = np.round(
             (dg_obs[:, self.mask] + 1.0) * self.N_bar[:, None]
         ).astype(np.int32)
 
-        self.theta_fixed = theta_fixed if not infer_theta else None
         self.lmax = 2 * self.Nside if lmax is None else lmax
         self.gen_lmax = 3 * self.Nside - 1 if gen_lmax is None else gen_lmax
 
@@ -142,7 +137,9 @@ class ForwardModel:
         # so these static index constants are never confused with JAX tracers.
         self._real_idx = np.where(self.gen_ell > 1)[0]
         self._imag_idx = np.where((self.gen_ell > 1) & (self.gen_emm > 0))[0]
-        self.n_modes = len(self._real_idx) + len(self._imag_idx)
+        self.n_real = len(self._real_idx)
+        self.n_imag = len(self._imag_idx)
+        self.n_modes = self.n_real + self.n_imag
 
     @staticmethod
     def _xi_NG_to_xi_G_g3(
@@ -596,15 +593,14 @@ class ForwardModel:
         Parameters
         ----------
         params : KarmmaPosition
-            Position to evaluate; `params.theta` is used if
-            `self.infer_theta`, otherwise `self.theta_fixed`.
+            Position to evaluate; both `params.xlm` and `params.theta`
+            must be set.
 
         Returns
         -------
         jnp.ndarray
             Log-density, summing the binomial likelihood, the `xlm`
-            prior, and (if `infer_theta`) `theta`'s prior and
-            change-of-variables Jacobian.
+            prior, and `theta`'s prior and change-of-variables Jacobian.
 
         Notes
         -----
@@ -615,7 +611,7 @@ class ForwardModel:
         (`dm_to_binom_params(..., mask_output=True)`), matching
         `Ng_obs`'s masked layout.
 
-        When `infer_theta`, two additional terms are added:
+        Two additional terms cover `theta`:
 
         - `log_jacobian_theta`: `log_T`/`log_R` are sampled in
           log-space, but `T`/`R` themselves have flat priors, so
@@ -629,7 +625,7 @@ class ForwardModel:
           `log(2)` term) with the InvGamma log-density in terms of
           `log_R`.
         """
-        theta = params.theta if self.infer_theta else self.theta_fixed
+        theta = params.theta
 
         deff = self.x2deff(params.xlm, theta)
 
@@ -640,22 +636,19 @@ class ForwardModel:
         log_prior_real = jnp.sum(jst.norm.logpdf(params.xlm.real, loc=0.0, scale=1.0))
         log_prior_imag = jnp.sum(jst.norm.logpdf(params.xlm.imag, loc=0.0, scale=1.0))
 
-        log_jacobian_theta = 0.0
-        log_prior_theta = 0.0
-        if self.infer_theta:
-            log_jacobian_theta = (
-                jnp.sum(theta.log_T)  # log_T -> T
-                + jnp.sum(theta.log_R)  # log_R -> R
-            )
-            log_prior_theta = (
-                # InvGamma(alpha, beta) prior on R^2, sampled as log_R.
-                +jnp.sum(theta.log_R)  # Jacobian: R^2 -> R
-                - 2.0
-                * (1.0 + _INVGAMMA_ALPHA_R)
-                * jnp.sum(theta.log_R)  # InvGamma log-prior
-                - _INVGAMMA_BETA_R
-                * jnp.sum(jnp.exp(-2.0 * theta.log_R))  # InvGamma log-prior
-            )
+        log_jacobian_theta = (
+            jnp.sum(theta.log_T)  # log_T -> T
+            + jnp.sum(theta.log_R)  # log_R -> R
+        )
+        log_prior_theta = (
+            # InvGamma(alpha, beta) prior on R^2, sampled as log_R.
+            +jnp.sum(theta.log_R)  # Jacobian: R^2 -> R
+            - 2.0
+            * (1.0 + _INVGAMMA_ALPHA_R)
+            * jnp.sum(theta.log_R)  # InvGamma log-prior
+            - _INVGAMMA_BETA_R
+            * jnp.sum(jnp.exp(-2.0 * theta.log_R))  # InvGamma log-prior
+        )
 
         return (
             log_prior_real
@@ -688,6 +681,62 @@ class ForwardModel:
             ),
         )
 
+    @staticmethod
+    @functools.partial(jax.jit, static_argnums=(3,))
+    def _inverse_cdf_scan(
+        n: jnp.ndarray, p: jnp.ndarray, u: jnp.ndarray, kmax: int
+    ) -> jnp.ndarray:
+        """Inverse-CDF sample the continuous-`n` binomial pmf, streamed via `fori_loop`.
+
+        Parameters
+        ----------
+        n, p : jnp.ndarray
+            Continuous binomial parameters, same shape (e.g. (Nbins, npix)).
+        u : jnp.ndarray
+            `Uniform(0, 1)` draws, same shape as `n`.
+        kmax : int
+            Largest count evaluated; static, since it sets the scan length.
+
+        Returns
+        -------
+        jnp.ndarray
+            Sampled counts, same shape as `n`.
+
+        Notes
+        -----
+        Builds the pmf via its exact ratio recursion rather than
+        evaluating `jax.scipy.stats.binom.logpmf` at every `k`, so a full
+        `(Nbins, npix, kmax)` table is never materialized.
+
+        For non-integer `n`, `k = ceil(n)` is provably the last point with
+        nonzero probability (the generalized binomial coefficient goes
+        negative just past it), independent of `p` — so `kmax` only needs
+        a margin for floating-point safety, not real tail allowance.
+
+        Known limitation: `(1-p)**n` can underflow to exactly `0.0` for
+        `p` near 1 and `n` upward of ~50, after which the recursion can't
+        recover. Not an issue in this model's actual regime (checked:
+        `n * -log1p(-p)` stays far below float64's ~745 underflow limit).
+        """
+        odds = p / (1.0 - p)
+        w = jnp.power(1.0 - p, n)  # pmf(0)
+        S = w
+        counts = (u > S).astype(jnp.int32)
+
+        def body(
+            k: jnp.ndarray, carry: tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+        ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+            """One recursion step: advance the pmf weight/running sum, and the count comparison."""
+            w, S, counts = carry
+            num = n - k + 1.0
+            ratio = jnp.where(num >= 0.0, num / k * odds, 0.0)
+            w = w * ratio
+            S = S + w
+            return (w, S, counts + (u > S).astype(jnp.int32))
+
+        _, _, counts = jax.lax.fori_loop(1, kmax + 1, body, (w, S, counts))
+        return counts.astype(jnp.float64)
+
     def generate_mock_dg_obs(
         self, xlm: XlmParams, theta: ThetaParams, key: jax.Array
     ) -> jnp.ndarray:
@@ -701,7 +750,7 @@ class ForwardModel:
         theta : ThetaParams
             Bias/nuisance parameters.
         key : jax.Array
-            JAX PRNG key for the binomial draw.
+            JAX PRNG key for the count draw.
 
         Returns
         -------
@@ -711,23 +760,19 @@ class ForwardModel:
 
         Notes
         -----
-        Pipeline: `xlm` -> `x2deff` -> `dm_to_binom_params` -> `(n, p)` ->
-        `jax.random.binomial(key, round(n), p)` (`n` is rounded since
-        `dm_to_binom_params` backs it out as `mean_Ng / p`, generally
-        non-integer) -> `counts / N_bar - 1`. Uses whichever `G_N`
-        transform (`self.gn_order`) this model is configured with
-        transparently, via `x2deff`.
+        Counts are drawn by exact inverse-CDF sampling from the same
+        continuous-`n` pmf `log_prob` uses (`_inverse_cdf_scan`), not by
+        rounding `n` first — rounding would sample from a distribution
+        other than the one the likelihood assumes, biasing recovery.
 
-        `(n, p)` are taken full-sky (`mask_output=False`) because the
-        mock is a HEALPix map: it gets written to disk and read back
-        through `KarmmaConfig`, whose `ForwardModel` reconstruction
-        infers `Nside` from its length. The shape also fixes how many
-        values the binomial consumes from `key`, so it sets the draw at
-        every pixel, footprint included.
+        `(n, p)` are full-sky (`mask_output=False`): the mock is a
+        complete HEALPix map, written to disk and read back for `Nside`.
         """
         deff = self.x2deff(xlm, theta)
         n, p = self.dm_to_binom_params(deff, theta, mask_output=False)
-        counts = jax.random.binomial(key, jnp.round(n), p)
+        kmax = int(np.ceil(float(jnp.max(n)))) + 1
+        u = jax.random.uniform(key, shape=n.shape, dtype=jnp.float64)
+        counts = self._inverse_cdf_scan(n, p, u, kmax)
         return counts / self.N_bar[:, None] - 1.0
 
     def make_random_mock(

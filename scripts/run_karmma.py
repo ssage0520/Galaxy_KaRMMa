@@ -44,13 +44,11 @@ model = ForwardModel(
     CL=io.cl,
     lbda=analysis.lbda,
     gn_order=analysis.gn_order,
-    infer_theta=mcmc.infer_theta,
-    theta_fixed=io.theta_fixed,
     pixwin=io.pixwin,
 )
 
 print(
-    f"Model initialized (nside={model.Nside}, nbins={model.Nbins}, n_modes={model.n_modes}, infer_theta={mcmc.infer_theta})."
+    f"Model initialized (nside={model.Nside}, nbins={model.Nbins}, n_modes={model.n_modes})."
 )
 
 # resolve random xlm init now that model shape info is available
@@ -76,6 +74,7 @@ if isinstance(mcmc, NutsConfig):
         imm_shrinkage_to_previous=mcmc.imm_shrinkage_to_previous,
         step_size=mcmc.step_size,
         target_acceptance_rate=mcmc.target_acceptance_rate,
+        save_xlm=io.save_maps,
     )
 elif isinstance(mcmc, MclmcConfig):
     print("Sampler: MCLMC")
@@ -92,6 +91,7 @@ elif isinstance(mcmc, MclmcConfig):
         thinning_warmup=mcmc.thinning_warmup,
         thinning_sampling=mcmc.thinning_sampling,
         desired_energy_var=mcmc.desired_energy_var,
+        save_xlm=io.save_maps,
     )
 else:
     raise ValueError(f"Unrecognized mcmc config type: {type(mcmc).__name__}")
@@ -100,14 +100,14 @@ else:
 os.makedirs(io.output_dir, exist_ok=True)
 
 with h5.File(os.path.join(io.output_dir, "samples.h5"), "w") as f:
-    xlm_grp = f.create_group("xlm")
-    xlm_grp.create_dataset("real", data=np.array(states.xlm.real))
-    xlm_grp.create_dataset("imag", data=np.array(states.xlm.imag))
+    if io.save_maps:
+        xlm_grp = f.create_group("xlm")
+        xlm_grp.create_dataset("real", data=np.array(states.xlm.real))
+        xlm_grp.create_dataset("imag", data=np.array(states.xlm.imag))
 
-    if states.theta is not None:
-        theta_grp = f.create_group("theta")
-        for field in ThetaParams._fields:
-            theta_grp.create_dataset(field, data=np.array(getattr(states.theta, field)))
+    theta_grp = f.create_group("theta")
+    for field in ThetaParams._fields:
+        theta_grp.create_dataset(field, data=np.array(getattr(states.theta, field)))
 
 with h5.File(os.path.join(io.output_dir, "mcmc_metadata.h5"), "w") as f:
     # run info
@@ -159,10 +159,11 @@ with h5.File(os.path.join(io.output_dir, "mcmc_metadata.h5"), "w") as f:
     for field in ThetaParams._fields:
         theta0_grp.create_dataset(field, data=np.array(getattr(sampler.theta0, field)))
 
-    # fixed bias parameters (only when not sampling theta)
-    if not mcmc.infer_theta:
-        grp = f.create_group("theta_fixed")
-        for field in ThetaParams._fields:
-            grp.create_dataset(field, data=np.array(getattr(io.theta_fixed, field)))
+    # model shape info, saved regardless of save_maps — needed to interpret
+    # the xlm block of inverse_mass_matrix above even when xlm samples aren't saved
+    model_shape_grp = f.create_group("model_shape")
+    model_shape_grp["nbins"] = np.array(model.Nbins)
+    model_shape_grp["n_real"] = np.array(model.n_real)
+    model_shape_grp["n_imag"] = np.array(model.n_imag)
 
 print("Samples and metadata saved.")

@@ -139,8 +139,8 @@ class KarmmaConfig:
         Raises
         ------
         ValueError
-            If `init_file` is provided but missing a `theta` group while
-            `infer_theta=True`, or if no theta source resolves at all.
+            If `init_file` is provided but missing a `theta` group, or if
+            no theta source resolves at all.
 
         Notes
         -----
@@ -151,25 +151,22 @@ class KarmmaConfig:
         `theta` priority order: `init_file`'s `theta` group, then
         `datafile`'s `true_theta` group, then `theta_file`'s `theta`
         group, then a `ValueError` if none resolve. Unlike `xlm`, `theta`
-        has no random-init fallback and must always resolve to a concrete
-        value here — even when `infer_theta=False`, the resolved value is
-        still needed as `theta_fixed` for `log_prob`.
+        has no random-init fallback: it's always part of the sampled
+        position, and `WhitenedSampler` builds its whitening eigenbasis
+        around the initial theta, so a concrete value must resolve here.
 
-        The `init_file`-specific validation (checked before the `theta`
-        priority chain runs) exists to catch a specific inconsistent
-        case: an `init_file` that has `xlm` but is missing `theta` while
-        `infer_theta=True`, so the caller doesn't get silently bounced to
-        `true_theta`/`theta_file` instead of continuing from their
-        intended init file.
+        An `init_file` that has `xlm` but no `theta` is rejected up front,
+        before the priority chain runs, rather than being silently
+        bounced to `true_theta`/`theta_file` — resuming from a partial
+        init file is far more likely to be a mistake than an intent.
 
-        TODO: `theta_fixed`/`infer_theta=False` is no longer actually
-        supported by the sampler backends — `WhitenedSampler`'s whitening
-        machinery assumes `theta` is part of the sampled position, so a
-        fixed theta breaks it. This whole section needs reworking, likely
-        removing `infer_theta` as an option entirely.
+        `save_maps` (default `True`) controls whether `xlm` is retained
+        during sampling and saved to `samples.h5`; `theta` is always saved.
         """
         input_dir = cfg["input_dir"]
         output_dir = cfg["output_dir"]
+        save_maps = bool(cfg.get("save_maps", True))
+        print(f"save_maps: {save_maps}")
 
         def _resolve(key):
             value = cfg.get(key)
@@ -212,10 +209,8 @@ class KarmmaConfig:
 
         # --- theta (priority order) ---
         # validate init_file completeness before falling through
-        if init_file and self.mcmc.infer_theta and not _h5_has(init_file, "theta"):
-            raise ValueError(
-                "init_file provided but missing 'theta' group; required when infer_theta=True."
-            )
+        if init_file and not _h5_has(init_file, "theta"):
+            raise ValueError("init_file provided but missing 'theta' group.")
         if init_file and _h5_has(init_file, "theta"):
             theta = _load_theta(init_file, "theta")
             print(f"theta init: {init_file}")
@@ -233,12 +228,7 @@ class KarmmaConfig:
             )
 
         # --- assemble ---
-        if self.mcmc.infer_theta:
-            initial_position = KarmmaPosition(xlm=xlm, theta=theta)
-            theta_fixed = None
-        else:
-            initial_position = KarmmaPosition(xlm=xlm)
-            theta_fixed = theta
+        initial_position = KarmmaPosition(xlm=xlm, theta=theta)
 
         return IoConfig(
             input_dir=input_dir,
@@ -250,7 +240,7 @@ class KarmmaConfig:
             cl=cl,
             pixwin=pixwin,
             initial_position=initial_position,
-            theta_fixed=theta_fixed,
+            save_maps=save_maps,
         )
 
     def _resolve_seed_and_key(self, cfg: dict) -> tuple[int, jax.Array]:
@@ -307,8 +297,6 @@ class KarmmaConfig:
         target_acceptance_rate = self._get_or_default(cfg, "target_acceptance_rate", 0.65)
         imm_shrinkage_to_previous = self._get_or_default(cfg, "imm_shrinkage_to_previous", 0.0)
 
-        infer_theta = bool(cfg.get("infer_theta", False))
-
         return NutsConfig(
             n_samples=n_samples,
             key=key,
@@ -317,7 +305,6 @@ class KarmmaConfig:
             step_size=step_size,
             target_acceptance_rate=target_acceptance_rate,
             imm_shrinkage_to_previous=imm_shrinkage_to_previous,
-            infer_theta=infer_theta,
         )
 
     def _set_mclmc(self, cfg: dict) -> MclmcConfig:
@@ -335,8 +322,6 @@ class KarmmaConfig:
         thinning_sampling = self._get_or_default(cfg, "thinning_sampling", 5, cast=int)
         desired_energy_var = self._get_or_default(cfg, "desired_energy_var", 5e-4)
 
-        infer_theta = bool(cfg.get("infer_theta", False))
-
         return MclmcConfig(
             n_samples=n_samples,
             key=key,
@@ -348,5 +333,4 @@ class KarmmaConfig:
             thinning_warmup=thinning_warmup,
             thinning_sampling=thinning_sampling,
             desired_energy_var=desired_energy_var,
-            infer_theta=infer_theta,
         )

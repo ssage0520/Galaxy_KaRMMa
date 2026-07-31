@@ -14,10 +14,10 @@ io:
     theta_file: theta_true.h5
     cl_file: cl_sim42.npy
     pixwin: pixwin_256.npy
+    save_maps: true
 
 mcmc:
     sampler: nuts
-    infer_theta: true
     seed: null
     num_warmup: 200
     n_samples: 400
