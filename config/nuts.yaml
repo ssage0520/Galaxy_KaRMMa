@@ -17,7 +17,6 @@ io:
 
 mcmc:
     sampler: nuts
-    infer_theta: true
     seed: null
     num_warmup: 200
     n_samples: 400

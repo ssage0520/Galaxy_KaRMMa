@@ -44,13 +44,11 @@ model = ForwardModel(
     CL=io.cl,
     lbda=analysis.lbda,
     gn_order=analysis.gn_order,
-    infer_theta=mcmc.infer_theta,
-    theta_fixed=io.theta_fixed,
     pixwin=io.pixwin,
 )
 
 print(
-    f"Model initialized (nside={model.Nside}, nbins={model.Nbins}, n_modes={model.n_modes}, infer_theta={mcmc.infer_theta})."
+    f"Model initialized (nside={model.Nside}, nbins={model.Nbins}, n_modes={model.n_modes})."
 )
 
 # resolve random xlm init now that model shape info is available
@@ -104,10 +102,9 @@ with h5.File(os.path.join(io.output_dir, "samples.h5"), "w") as f:
     xlm_grp.create_dataset("real", data=np.array(states.xlm.real))
     xlm_grp.create_dataset("imag", data=np.array(states.xlm.imag))
 
-    if states.theta is not None:
-        theta_grp = f.create_group("theta")
-        for field in ThetaParams._fields:
-            theta_grp.create_dataset(field, data=np.array(getattr(states.theta, field)))
+    theta_grp = f.create_group("theta")
+    for field in ThetaParams._fields:
+        theta_grp.create_dataset(field, data=np.array(getattr(states.theta, field)))
 
 with h5.File(os.path.join(io.output_dir, "mcmc_metadata.h5"), "w") as f:
     # run info
@@ -158,11 +155,5 @@ with h5.File(os.path.join(io.output_dir, "mcmc_metadata.h5"), "w") as f:
     theta0_grp = reparam_grp.create_group("theta0")
     for field in ThetaParams._fields:
         theta0_grp.create_dataset(field, data=np.array(getattr(sampler.theta0, field)))
-
-    # fixed bias parameters (only when not sampling theta)
-    if not mcmc.infer_theta:
-        grp = f.create_group("theta_fixed")
-        for field in ThetaParams._fields:
-            grp.create_dataset(field, data=np.array(getattr(io.theta_fixed, field)))
 
 print("Samples and metadata saved.")

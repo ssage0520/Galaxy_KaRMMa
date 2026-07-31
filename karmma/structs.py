@@ -58,13 +58,12 @@ class KarmmaPosition(NamedTuple):
     xlm : XlmParams or None
         Field coefficients; `None` when awaiting random initialization
         (resolved in `run_karmma.py`).
-    theta : ThetaParams or None
-        Bias/nuisance parameters, when sampled jointly with `xlm`;
-        `None` when `theta` is held fixed instead.
+    theta : ThetaParams
+        Bias/nuisance parameters, sampled jointly with `xlm`.
     """
 
     xlm: XlmParams | None
-    theta: ThetaParams | None = None
+    theta: ThetaParams
 
 
 class WhitenedKarmmaPosition(NamedTuple):
@@ -144,9 +143,6 @@ class NutsConfig(NamedTuple):
     imm_shrinkage_to_previous : float
         Pseudo-count controlling shrinkage of each warmup window's
         adapted inverse mass matrix toward the previous window's.
-    infer_theta : bool
-        Whether `theta` is sampled jointly with `xlm` (`True`) or held
-        fixed (`False`).
     """
 
     n_samples: int
@@ -156,7 +152,6 @@ class NutsConfig(NamedTuple):
     step_size: float
     target_acceptance_rate: float
     imm_shrinkage_to_previous: float
-    infer_theta: bool
 
 
 class MclmcConfig(NamedTuple):
@@ -186,9 +181,6 @@ class MclmcConfig(NamedTuple):
         Thinning applied during the final sampling phase.
     desired_energy_var : float
         Target per-step energy-change variance for step-size dual averaging.
-    infer_theta : bool
-        Whether `theta` is sampled jointly with `xlm` (`True`) or held
-        fixed (`False`).
     """
 
     n_samples: int
@@ -201,7 +193,6 @@ class MclmcConfig(NamedTuple):
     thinning_warmup: int
     thinning_sampling: int
     desired_energy_var: float
-    infer_theta: bool
 
 
 class AnalysisConfig(NamedTuple):
@@ -254,8 +245,6 @@ class IoConfig(NamedTuple):
         or `None` if not applied.
     initial_position : KarmmaPosition
         Starting position for sampling.
-    theta_fixed : ThetaParams or None
-        Fixed bias parameters; `None` when `infer_theta=True`.
     """
 
     input_dir: str
@@ -267,4 +256,3 @@ class IoConfig(NamedTuple):
     cl: np.ndarray
     pixwin: np.ndarray | None
     initial_position: KarmmaPosition
-    theta_fixed: ThetaParams | None

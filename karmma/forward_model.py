@@ -44,17 +44,12 @@ class ForwardModel:
         Pixel angular size in radians (`hp.nside2resol(Nside)`).
     map_shape : tuple of int
         Shape of `dg_obs`.
-    infer_theta : bool
-        Whether `theta` is sampled jointly with `xlm` (True) or held
-        fixed at `theta_fixed` (False).
     N_bar : np.ndarray
         Average galaxy count per pixel, per bin — averaged across the
         full sky, not just the observed/masked region.
     Ng_obs : np.ndarray
         Observed galaxy counts per masked pixel, per bin —
         `(dg_obs[:, mask] + 1) * N_bar`, rounded to the nearest integer.
-    theta_fixed : ThetaParams or None
-        Fixed bias parameters; `None` unless `infer_theta=False`.
     lmax : int
         Maximum multipole of the output maps, by default `2 * Nside`.
     gen_lmax : int
@@ -93,8 +88,6 @@ class ForwardModel:
         lbda: np.ndarray,
         gn_order: int,
         N_bar: np.ndarray | None = None,
-        infer_theta: bool = False,
-        theta_fixed: ThetaParams | None = None,
         lmax: int | None = None,
         gen_lmax: int | None = None,
         pixwin: np.ndarray | None = None,
@@ -120,14 +113,11 @@ class ForwardModel:
         self.pixel_size = float(hp.nside2resol(self.Nside))
         self.map_shape = dg_obs.shape
 
-        self.infer_theta = infer_theta
-
         self.N_bar = np.asarray(N_bar)
         self.Ng_obs = np.round(
             (dg_obs[:, self.mask] + 1.0) * self.N_bar[:, None]
         ).astype(np.int32)
 
-        self.theta_fixed = theta_fixed if not infer_theta else None
         self.lmax = 2 * self.Nside if lmax is None else lmax
         self.gen_lmax = 3 * self.Nside - 1 if gen_lmax is None else gen_lmax
 
@@ -596,15 +586,14 @@ class ForwardModel:
         Parameters
         ----------
         params : KarmmaPosition
-            Position to evaluate; `params.theta` is used if
-            `self.infer_theta`, otherwise `self.theta_fixed`.
+            Position to evaluate; both `params.xlm` and `params.theta`
+            must be set.
 
         Returns
         -------
         jnp.ndarray
             Log-density, summing the binomial likelihood, the `xlm`
-            prior, and (if `infer_theta`) `theta`'s prior and
-            change-of-variables Jacobian.
+            prior, and `theta`'s prior and change-of-variables Jacobian.
 
         Notes
         -----
@@ -615,7 +604,7 @@ class ForwardModel:
         (`dm_to_binom_params(..., mask_output=True)`), matching
         `Ng_obs`'s masked layout.
 
-        When `infer_theta`, two additional terms are added:
+        Two additional terms cover `theta`:
 
         - `log_jacobian_theta`: `log_T`/`log_R` are sampled in
           log-space, but `T`/`R` themselves have flat priors, so
@@ -629,7 +618,7 @@ class ForwardModel:
           `log(2)` term) with the InvGamma log-density in terms of
           `log_R`.
         """
-        theta = params.theta if self.infer_theta else self.theta_fixed
+        theta = params.theta
 
         deff = self.x2deff(params.xlm, theta)
 
@@ -640,22 +629,19 @@ class ForwardModel:
         log_prior_real = jnp.sum(jst.norm.logpdf(params.xlm.real, loc=0.0, scale=1.0))
         log_prior_imag = jnp.sum(jst.norm.logpdf(params.xlm.imag, loc=0.0, scale=1.0))
 
-        log_jacobian_theta = 0.0
-        log_prior_theta = 0.0
-        if self.infer_theta:
-            log_jacobian_theta = (
-                jnp.sum(theta.log_T)  # log_T -> T
-                + jnp.sum(theta.log_R)  # log_R -> R
-            )
-            log_prior_theta = (
-                # InvGamma(alpha, beta) prior on R^2, sampled as log_R.
-                +jnp.sum(theta.log_R)  # Jacobian: R^2 -> R
-                - 2.0
-                * (1.0 + _INVGAMMA_ALPHA_R)
-                * jnp.sum(theta.log_R)  # InvGamma log-prior
-                - _INVGAMMA_BETA_R
-                * jnp.sum(jnp.exp(-2.0 * theta.log_R))  # InvGamma log-prior
-            )
+        log_jacobian_theta = (
+            jnp.sum(theta.log_T)  # log_T -> T
+            + jnp.sum(theta.log_R)  # log_R -> R
+        )
+        log_prior_theta = (
+            # InvGamma(alpha, beta) prior on R^2, sampled as log_R.
+            +jnp.sum(theta.log_R)  # Jacobian: R^2 -> R
+            - 2.0
+            * (1.0 + _INVGAMMA_ALPHA_R)
+            * jnp.sum(theta.log_R)  # InvGamma log-prior
+            - _INVGAMMA_BETA_R
+            * jnp.sum(jnp.exp(-2.0 * theta.log_R))  # InvGamma log-prior
+        )
 
         return (
             log_prior_real

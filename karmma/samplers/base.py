@@ -54,8 +54,8 @@ class WhitenedSampler:
         Parameters
         ----------
         position : KarmmaPosition
-            Position to linearize around; `position.theta` must be set
-            (requires the sampler's `infer_theta=True`).
+            Position to linearize around; both `position.xlm` and
+            `position.theta` must be set.
         tol : float, optional
             CG solver tolerance, by default 1e-3.
         maxiter : int, optional

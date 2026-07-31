@@ -16,7 +16,6 @@ io:
 
 mcmc:
     sampler: mclmc
-    infer_theta: true
     seed: null
     n_samples: 750
     frac_tune1: 0.1
