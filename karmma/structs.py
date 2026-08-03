@@ -241,8 +241,9 @@ class IoConfig(NamedTuple):
         full sky, not just the observed/masked region.
     cl : np.ndarray
         Target (physical, non-Gaussian) angular power spectra, shape
-        (Nbins, Nbins, gen_lmax + 1); off-diagonal entries `cl[i, j]`
-        (i != j) are cross-power spectra between bins i and j.
+        (Nbins, Nbins, pad_lmax + 1) (see `ForwardModel.pad_lmax`);
+        off-diagonal entries `cl[i, j]` (i != j) are cross-power spectra
+        between bins i and j.
     pixwin : np.ndarray or None
         Pixel window function, indexed by multipole (length >= lmax + 1),
         or `None` if not applied.

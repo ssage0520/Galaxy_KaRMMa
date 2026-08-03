@@ -36,7 +36,7 @@ class ForwardModel:
         uniformly across all bins (never mixed per-bin).
     CL : np.ndarray
         Target (physical, non-Gaussian) angular power spectra, shape
-        (Nbins, Nbins, gen_lmax + 1); off-diagonal entries `CL[i, j]`
+        (Nbins, Nbins, pad_lmax + 1); off-diagonal entries `CL[i, j]`
         (i != j) are cross-power spectra between bins i and j.
     Nbins : int
         Number of tomographic bins (`dg_obs.shape[0]`).
@@ -58,6 +58,14 @@ class ForwardModel:
         Maximum multipole used internally for Gaussian field generation,
         by default `3 * Nside - 1` (higher than `lmax`, to avoid
         aliasing from the nonlinear lognormal transform).
+    pad_lmax : int
+        Maximum multipole of the input `CL` and of the `CL -> CL_G`
+        Legendre round-trip, `3.5 * Nside - 1` (higher than `gen_lmax`).
+        Truncating that round-trip's quadrature at `gen_lmax` directly
+        leaves ringing/mode-mixing artifacts (worse for `gn_order=3`)
+        inside the multipole range that's actually kept; computing it
+        out to `pad_lmax` and discarding the `(gen_lmax, pad_lmax]`
+        buffer pushes those artifacts out of the retained range instead.
     ell, emm : np.ndarray
         Harmonic (l, m) index arrays at `lmax` resolution, from
         `hp.Alm.getlm(lmax)`.
@@ -125,6 +133,13 @@ class ForwardModel:
 
         self.lmax = 2 * self.Nside if lmax is None else lmax
         self.gen_lmax = 3 * self.Nside - 1 if gen_lmax is None else gen_lmax
+        self.pad_lmax = int(3.5 * self.Nside) - 1
+
+        if self.CL.shape[-1] != self.pad_lmax + 1:
+            raise ValueError(
+                f"CL has {self.CL.shape[-1]} multipoles, expected "
+                f"pad_lmax + 1 = {self.pad_lmax + 1}"
+            )
 
         self.ell, self.emm = hp.Alm.getlm(self.lmax)
         self.gen_ell, self.gen_emm = hp.Alm.getlm(self.gen_lmax)
@@ -218,10 +233,10 @@ class ForwardModel:
         i, j : int
             Tomographic bin indices.
         ell_array : np.ndarray
-            Multipoles 0..gen_lmax.
+            Multipoles 0..pad_lmax.
         P_ell : np.ndarray
             Legendre polynomials `P_ell(mu)` at the quadrature nodes
-            `mu`, shape (gen_lmax + 1, n_quad).
+            `mu`, shape (pad_lmax + 1, n_quad).
         w : np.ndarray
             Gauss-Legendre quadrature weights, shape (n_quad,).
         newton_iter, newton_tol : int, float, optional
@@ -231,8 +246,11 @@ class ForwardModel:
         Returns
         -------
         np.ndarray
-            Gaussianized power spectrum for bin pair (i, j), shape
-            (gen_lmax + 1,).
+            Gaussianized power spectrum for bin pair (i, j), at the
+            padded resolution, shape (pad_lmax + 1,). `compute_CL_G`
+            truncates this to `gen_lmax + 1` before storing it, to drop
+            the high-multipole buffer used to keep the retained range
+            free of quadrature/mode-mixing artifacts.
 
         Notes
         -----
@@ -283,7 +301,7 @@ class ForwardModel:
         ----------
         quad_order : int, optional
             Gauss-Legendre quadrature order multiplier — uses
-            `quad_order * gen_lmax` quadrature points, by default 2.
+            `quad_order * pad_lmax` quadrature points, by default 2.
         newton_iter : int, optional
             Maximum Newton iterations for the `gn_order=3` case, by
             default 50. Ignored when `gn_order=2`.
@@ -295,13 +313,17 @@ class ForwardModel:
         -----
         Calls `_compute_CL_G_binpair` once per bin pair (i, j) with
         i >= j, mirroring the result across the diagonal since `CL_G` is
-        symmetric in the bin indices. Sets `self.CL_G` and `self.L_G`
-        (`CL_G`'s per-multipole Cholesky factor, used by `apply_CL_G`).
+        symmetric in the bin indices. The Legendre round-trip itself
+        runs at `pad_lmax` resolution; each bin pair's result is then
+        truncated to `gen_lmax + 1` before being stored, discarding the
+        `(gen_lmax, pad_lmax]` buffer (see `pad_lmax`'s docstring). Sets
+        `self.CL_G` and `self.L_G` (`CL_G`'s per-multipole Cholesky
+        factor, used by `apply_CL_G`), both at `gen_lmax` resolution.
         """
-        mu, w = roots_legendre(quad_order * self.gen_lmax)
-        ell_array = np.arange(self.gen_lmax + 1)
-        P_ell = legendre_p_all(self.gen_lmax, mu).squeeze()
-        self.CL_G = np.zeros_like(self.CL)
+        mu, w = roots_legendre(quad_order * self.pad_lmax)
+        ell_array = np.arange(self.pad_lmax + 1)
+        P_ell = legendre_p_all(self.pad_lmax, mu).squeeze()
+        self.CL_G = np.zeros((self.Nbins, self.Nbins, self.gen_lmax + 1))
         for i in range(self.Nbins):
             for j in range(i + 1):
                 self.CL_G[i, j, :] = self._compute_CL_G_binpair(
@@ -312,7 +334,7 @@ class ForwardModel:
                     w,
                     newton_iter=newton_iter,
                     newton_tol=newton_tol,
-                )
+                )[: self.gen_lmax + 1]
                 if i != j:
                     self.CL_G[j, i] = self.CL_G[i, j]
         CL_T = np.moveaxis(self.CL_G, 2, 0)
