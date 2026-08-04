@@ -18,6 +18,10 @@ _INVGAMMA_ALPHA_R = 1.0  # TODO: expose in McmcConfig
 _INVGAMMA_BETA_R = (5.0 / 8.0) ** 2.0  # TODO: expose in McmcConfig
 
 
+class _KmaxExceeded(Exception):
+    """Raised by generate_mock_dg_obs; caught by make_random_mock to redraw xlm."""
+
+
 class ForwardModel:
     """Forward model from harmonic-space xlm coefficients to the galaxy-count log-density.
 
@@ -789,10 +793,19 @@ class ForwardModel:
 
         `(n, p)` are full-sky (`mask_output=False`): the mock is a
         complete HEALPix map, written to disk and read back for `Nside`.
+
+        Raises
+        ------
+        _KmaxExceeded
+            If `kmax` comes out above 5000 — an extreme `deff` outlier
+            can send `n` (and so `kmax`) into the millions, making
+            `_inverse_cdf_scan` hang. Caught by `make_random_mock`.
         """
         deff = self.x2deff(xlm, theta)
         n, p = self.dm_to_binom_params(deff, theta, mask_output=False)
         kmax = int(np.ceil(float(jnp.max(n)))) + 1
+        if kmax > 5000:
+            raise _KmaxExceeded(kmax)
         u = jax.random.uniform(key, shape=n.shape, dtype=jnp.float64)
         counts = self._inverse_cdf_scan(n, p, u, kmax)
         return counts / self.N_bar[:, None] - 1.0
@@ -805,9 +818,9 @@ class ForwardModel:
         Parameters
         ----------
         key : jax.Array
-            JAX PRNG key; split internally into an `xlm`-draw key (see
-            `make_random_xlm`) and a binomial-draw key (see
-            `generate_mock_dg_obs`).
+            JAX PRNG key; re-split on each attempt into a fresh
+            `xlm`-draw key (see `make_random_xlm`) and binomial-draw key
+            (see `generate_mock_dg_obs`).
         theta : ThetaParams
             Bias/nuisance parameters.
 
@@ -818,8 +831,22 @@ class ForwardModel:
         dg_obs : jnp.ndarray
             Its corresponding synthetic galaxy overdensity map, shape
             (Nbins, npix).
+
+        Raises
+        ------
+        RuntimeError
+            If 20 consecutive draws all raise `_KmaxExceeded` (see
+            `generate_mock_dg_obs`) — rejects an `xlm` draw and retries
+            with a fresh split of `key` on each occurrence, so exhausting
+            the budget means something systematic rather than one rare
+            outlier.
         """
-        xlm_key, obs_key = jax.random.split(key)
-        xlm = self.make_random_xlm(xlm_key)
-        dg_obs = self.generate_mock_dg_obs(xlm, theta, obs_key)
-        return xlm, dg_obs
+        for _ in range(20):
+            key, xlm_key, obs_key = jax.random.split(key, 3)
+            xlm = self.make_random_xlm(xlm_key)
+            try:
+                dg_obs = self.generate_mock_dg_obs(xlm, theta, obs_key)
+            except _KmaxExceeded:
+                continue
+            return xlm, dg_obs
+        raise RuntimeError("make_random_mock: 20 consecutive draws all exceeded kmax=5000")
