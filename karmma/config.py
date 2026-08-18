@@ -177,7 +177,8 @@ class KarmmaConfig:
         save_maps = bool(cfg.get("save_maps", True))
         print(f"save_maps: {save_maps}")
 
-        def _resolve(key):
+        def _resolve(key: str) -> str | None:
+            """Join `cfg[key]` onto `input_dir`, or return `None` if unset/empty."""
             value = cfg.get(key)
             return os.path.join(input_dir, value) if value else None
 
