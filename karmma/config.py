@@ -90,7 +90,7 @@ class KarmmaConfig:
         Returns
         -------
         lbda : np.ndarray
-            Shape (gn_order, Nbins), rows in the order `ForwardModel.gn`
+            Shape (gn_order, Nbins), rows in the order `ForwardModel.gn_inv`
             expects: (alpha, beta) for gn_order=2, (a, b, c) for gn_order=3.
         gn_order : int
             2 or 3, inferred from which keys are present.
@@ -139,14 +139,23 @@ class KarmmaConfig:
         Raises
         ------
         ValueError
-            If `init_file` is provided but missing a `theta` group, or if
-            no theta source resolves at all.
+            If `xlm_init` is not `"data"` or `"truth"`; if
+            `xlm_init: truth` is requested but `datafile` has no
+            `true_xlm` group; if `init_file` is provided but missing a
+            `theta` group; or if no theta source resolves at all.
 
         Notes
         -----
-        `xlm` priority order: `init_file`'s `xlm` group, then `datafile`'s
-        `true_xlm` group, then `None` (deferred to a random draw via
-        `sampler.make_random_xlm()` in `run_karmma.py`).
+        `xlm` priority order: `init_file`'s `xlm` group, then whatever
+        `xlm_init` selects (default `"data"`). `xlm_init: truth` takes
+        `datafile`'s `true_xlm`; `xlm_init: data` leaves `xlm` as `None`,
+        deferring to `init_xlm_from_data` in `run_karmma.py` — building it
+        needs a `ForwardModel`, which does not exist yet at config time.
+
+        `"data"` is the default because it is the only option available
+        for real data, and starting a mock run at its own truth biases
+        coverage tests. Set `xlm_init: truth` to recover the old
+        behaviour.
 
         `theta` priority order: `init_file`'s `theta` group, then
         `datafile`'s `true_theta` group, then `theta_file`'s `theta`
@@ -196,16 +205,28 @@ class KarmmaConfig:
             print("Pixel window: none (warning: this may bias your results)")
 
         # --- xlm (priority order) ---
+        xlm_init = cfg.get("xlm_init", "data")
+        if xlm_init not in ("data", "truth"):
+            raise ValueError(
+                f"io.xlm_init must be 'data' or 'truth', got {xlm_init!r}."
+            )
+
         # `init_file and ...` short-circuits safely when init_file is None
         if init_file and _h5_has(init_file, "xlm"):
             xlm = _load_xlm(init_file, "xlm")
             print(f"xlm init: {init_file}")
-        elif _h5_has(datafile, "true_xlm"):
+        elif xlm_init == "truth":
+            if not _h5_has(datafile, "true_xlm"):
+                raise ValueError(
+                    f"io.xlm_init is 'truth' but {datafile} has no 'true_xlm' "
+                    "group. Use xlm_init: data to build the initial xlm from "
+                    "the observed counts instead."
+                )
             xlm = _load_xlm(datafile, "true_xlm")
             print("xlm init: truth from datafile")
         else:
-            xlm = None  # signals run_karmma.py to call sampler.make_random_xlm()
-            print("xlm init: random (deferred to sampler)")
+            xlm = None  # signals run_karmma.py to call init_xlm_from_data()
+            print("xlm init: from data (deferred until the model is built)")
 
         # --- theta (priority order) ---
         # validate init_file completeness before falling through
@@ -241,6 +262,7 @@ class KarmmaConfig:
             pixwin=pixwin,
             initial_position=initial_position,
             save_maps=save_maps,
+            xlm_init=xlm_init,
         )
 
     def _resolve_seed_and_key(self, cfg: dict) -> tuple[int, jax.Array]:

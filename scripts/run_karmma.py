@@ -21,13 +21,13 @@ import h5py as h5
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from karmma import ForwardModel, KarmmaConfig
+from karmma.initialization import fit_bias, init_xlm_from_data
 from karmma.samplers import MCLMCSampler, NUTSSampler
 from karmma.structs import (
     KarmmaPosition,
     MclmcConfig,
     NutsConfig,
     ThetaParams,
-    XlmParams,
 )
 
 configfile = sys.argv[1]
@@ -51,11 +51,12 @@ print(
     f"Model initialized (nside={model.Nside}, nbins={model.Nbins}, n_modes={model.n_modes})."
 )
 
-# resolve random xlm init now that model shape info is available
+# config defers `xlm_init: data` to here, since building it needs the model's
+# CL_G/L_G, which only exist once the ForwardModel is constructed.
+b_fit = None
 if io.initial_position.xlm is None:
-    key, init_key = jax.random.split(mcmc.key)
-    xlm_full = model.make_random_xlm(init_key)
-    xlm = XlmParams(real=0.3 * xlm_full.real, imag=0.3 * xlm_full.imag)
+    b_fit = fit_bias(model)
+    xlm = init_xlm_from_data(model, io.initial_position.theta, b=b_fit)
     initial_position = KarmmaPosition(xlm=xlm, theta=io.initial_position.theta)
 else:
     initial_position = io.initial_position
@@ -112,6 +113,8 @@ with h5.File(os.path.join(io.output_dir, "samples.h5"), "w") as f:
 with h5.File(os.path.join(io.output_dir, "mcmc_metadata.h5"), "w") as f:
     # run info
     f["seed"] = np.array(mcmc.seed)
+    if b_fit is not None:
+        f["xlm_init_bias"] = np.array(b_fit)
 
     if isinstance(mcmc, NutsConfig):
         # blackjax's window_adaptation returns tuned params as a plain dict

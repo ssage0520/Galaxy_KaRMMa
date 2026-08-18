@@ -248,10 +248,17 @@ class IoConfig(NamedTuple):
         Pixel window function, indexed by multipole (length >= lmax + 1),
         or `None` if not applied.
     initial_position : KarmmaPosition
-        Starting position for sampling.
+        Starting position for sampling. Its `xlm` is `None` when
+        `xlm_init` is `"data"`, since building it needs a `ForwardModel`
+        that does not exist yet at config time.
     save_maps : bool
         Whether `xlm` is retained in memory during sampling and written to
         `samples.h5`; `theta` is always saved regardless.
+    xlm_init : str
+        How `initial_position.xlm` is chosen: `"data"` to construct it
+        from `dg_obs` (see `karmma.initialization.init_xlm_from_data`), or
+        `"truth"` to take the datafile's `true_xlm`. Ignored when
+        `init_file` supplies an `xlm` group, which outranks both.
     """
 
     input_dir: str
@@ -264,3 +271,4 @@ class IoConfig(NamedTuple):
     pixwin: np.ndarray | None
     initial_position: KarmmaPosition
     save_maps: bool
+    xlm_init: str
