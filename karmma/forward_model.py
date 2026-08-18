@@ -88,7 +88,7 @@ class ForwardModel:
     _real_idx, _imag_idx : np.ndarray
         Indices selecting the free (non-redundant) real/imaginary
         harmonic modes of a real field, for packing/unpacking
-        `XlmParams` (see `get_xlm`).
+        `XlmParams` (see `unpack_xlm`).
     n_modes : int
         Total number of free `xlm` parameters (`len(_real_idx) +
         len(_imag_idx)`).
@@ -152,7 +152,7 @@ class ForwardModel:
 
         self.compute_CL_G()
 
-        # Precomputed so that get_xlm can be jit compiled — numpy, not jnp,
+        # Precomputed so that unpack_xlm can be jit compiled — numpy, not jnp,
         # so these static index constants are never confused with JAX tracers.
         self._real_idx = np.where(self.gen_ell > 1)[0]
         self._imag_idx = np.where((self.gen_ell > 1) & (self.gen_emm > 0))[0]
@@ -345,7 +345,7 @@ class ForwardModel:
         L_T = np.linalg.cholesky(CL_T)
         self.L_G = np.moveaxis(L_T, 0, 2)
 
-    def get_xlm(self, xlm: XlmParams) -> jnp.ndarray:
+    def unpack_xlm(self, xlm: XlmParams) -> jnp.ndarray:
         """Unpack `xlm`'s free real/imaginary parameters into the full complex harmonic array.
 
         Parameters
@@ -373,7 +373,7 @@ class ForwardModel:
     def pack_xlm(self, xlm_array: jnp.ndarray) -> XlmParams:
         """Pack a full complex harmonic array into the free real/imaginary parameters.
 
-        Inverse of `get_xlm`.
+        Inverse of `unpack_xlm`.
 
         Parameters
         ----------
@@ -388,10 +388,10 @@ class ForwardModel:
 
         Notes
         -----
-        The modes `get_xlm` leaves at zero — the monopole/dipole, and the
+        The modes `unpack_xlm` leaves at zero — the monopole/dipole, and the
         imaginary part of m=0 — are dropped rather than carried, so
-        `pack_xlm(get_xlm(x))` reproduces `x` exactly, while
-        `get_xlm(pack_xlm(a))` zeroes those entries of `a`.
+        `pack_xlm(unpack_xlm(x))` reproduces `x` exactly, while
+        `unpack_xlm(pack_xlm(a))` zeroes those entries of `a`.
         """
         return XlmParams(
             real=xlm_array.real[:, self._real_idx],
@@ -405,7 +405,7 @@ class ForwardModel:
         ----------
         xlm_array : jnp.ndarray
             Full complex harmonic-coefficient array (independent per
-            bin), as returned by `get_xlm`, shape (Nbins, len(gen_ell)).
+            bin), as returned by `unpack_xlm`, shape (Nbins, len(gen_ell)).
 
         Returns
         -------
@@ -448,7 +448,7 @@ class ForwardModel:
         -------
         np.ndarray
             Independent per-bin complex harmonic coefficients, same shape
-            as `ylm`, in the convention `get_xlm` produces.
+            as `ylm`, in the convention `unpack_xlm` produces.
 
         Notes
         -----
@@ -636,21 +636,21 @@ class ForwardModel:
         else:
             raise ValueError(f"Unknown model type: {N}")
 
-    def x2deff(self, xlm: XlmParams, theta: ThetaParams) -> jnp.ndarray:
+    def xlm_to_deff(self, xlm: XlmParams, theta: ThetaParams) -> jnp.ndarray:
         """Forward-model `xlm` into the effective density field used for the likelihood.
 
-        Follows `x2dm`'s pipeline up through the harmonic-space density
+        Follows `xlm_to_dm`'s pipeline up through the harmonic-space density
         contrast `dm_lm`, then additionally applies a theta-dependent
         smoothing filter before transforming back to a map.
 
         Parameters
         ----------
         xlm : XlmParams
-            Free harmonic coefficients (see `get_xlm`).
+            Free harmonic coefficients (see `unpack_xlm`).
         theta : ThetaParams
             Bias/nuisance parameters; only `c` (smoothing amplitude) and
             `log_R` (smoothing scale) are used here — the rest are used
-            later, in `dm_to_binom_params`.
+            later, in `deff_to_binom_params`.
 
         Returns
         -------
@@ -659,12 +659,12 @@ class ForwardModel:
 
         Notes
         -----
-        After `dm_lm` (see `x2dm`), applies
+        After `dm_lm` (see `xlm_to_dm`), applies
         `filt = (1 + c * b_ell) * pixwin`, where `b_ell` is a Gaussian
         smoothing kernel of scale `R = exp(log_R) * pixel_size`, then
         transforms back to a map.
         """
-        xlm_full = self.get_xlm(xlm)
+        xlm_full = self.unpack_xlm(xlm)
         ylm = self.apply_CL_G(xlm_full)
 
         ys = alm2map(ylm, self.Nside, self.gen_lmax)
@@ -681,13 +681,13 @@ class ForwardModel:
         )
         return alm2map(dm_lm * filt, self.Nside, self.lmax)
 
-    def x2dm(self, xlm: XlmParams) -> jnp.ndarray:
+    def xlm_to_dm(self, xlm: XlmParams) -> jnp.ndarray:
         """Forward-model `xlm` into the raw density contrast map.
 
         Parameters
         ----------
         xlm : XlmParams
-            Free harmonic coefficients (see `get_xlm`).
+            Free harmonic coefficients (see `unpack_xlm`).
 
         Returns
         -------
@@ -696,14 +696,14 @@ class ForwardModel:
 
         Notes
         -----
-        Pipeline: `xlm` -> full harmonic array (`get_xlm`) -> correlated
+        Pipeline: `xlm` -> full harmonic array (`unpack_xlm`) -> correlated
         Gaussian field harmonics (`apply_CL_G`) -> Gaussian field map
         `ys` (`alm2map`) -> the configured `G_N` point transform (`gn_inv`,
         `self.gn_order`/`self.lbda`) to the density contrast `dm` -> back
         to harmonic space (`map2alm`), pixel-window-filtered if set ->
         back to a map.
         """
-        xlm_full = self.get_xlm(xlm)
+        xlm_full = self.unpack_xlm(xlm)
         ylm = self.apply_CL_G(xlm_full)
 
         ys = alm2map(ylm, self.Nside, self.gen_lmax)
@@ -713,7 +713,7 @@ class ForwardModel:
             dm_lm = dm_lm * self.pixwin[self.ell]
         return alm2map(dm_lm, self.Nside, self.lmax)
 
-    def dm_to_binom_params(
+    def deff_to_binom_params(
         self, deff: jnp.ndarray, theta: ThetaParams, *, mask_output: bool = False
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Convert the effective density field into binomial (n, p) count parameters.
@@ -722,7 +722,7 @@ class ForwardModel:
         ----------
         deff : jnp.ndarray
             Effective density contrast over the full sky, shape
-            (Nbins, npix), as returned by `x2deff` — full-sky for either
+            (Nbins, npix), as returned by `xlm_to_deff` — full-sky for either
             `mask_output` setting.
         theta : ThetaParams
             Bias/nuisance parameters; uses `A_t`, `log_T` (detection
@@ -825,7 +825,7 @@ class ForwardModel:
         imaginary free parameters.
 
         The binomial term is evaluated on the observed footprint only
-        (`dm_to_binom_params(..., mask_output=True)`), matching
+        (`deff_to_binom_params(..., mask_output=True)`), matching
         `Ng_obs`'s masked layout.
 
         Two additional terms cover `theta`:
@@ -844,9 +844,9 @@ class ForwardModel:
         """
         theta = params.theta
 
-        deff = self.x2deff(params.xlm, theta)
+        deff = self.xlm_to_deff(params.xlm, theta)
 
-        n, p = self.dm_to_binom_params(deff, theta, mask_output=True)
+        n, p = self.deff_to_binom_params(deff, theta, mask_output=True)
 
         log_lik = jnp.sum(jst.binom.logpmf(self.Ng_obs, n, p))
 
@@ -962,7 +962,7 @@ class ForwardModel:
         Parameters
         ----------
         xlm : XlmParams
-            Free harmonic coefficients (see `get_xlm`) — the latent truth
+            Free harmonic coefficients (see `unpack_xlm`) — the latent truth
             to generate a mock observation from.
         theta : ThetaParams
             Bias/nuisance parameters.
@@ -992,8 +992,8 @@ class ForwardModel:
             can send `n` (and so `kmax`) into the millions, making
             `_inverse_cdf_scan` hang. Caught by `make_random_mock`.
         """
-        deff = self.x2deff(xlm, theta)
-        n, p = self.dm_to_binom_params(deff, theta, mask_output=False)
+        deff = self.xlm_to_deff(xlm, theta)
+        n, p = self.deff_to_binom_params(deff, theta, mask_output=False)
         kmax = int(np.ceil(float(jnp.max(n)))) + 1
         if kmax > 5000:
             raise _KmaxExceeded(kmax)

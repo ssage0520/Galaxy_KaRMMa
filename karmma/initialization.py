@@ -91,7 +91,7 @@ def fit_bias(
     target = _target_ys_var(model)
 
     # Lowest dm the transform accepts: -beta for G2, from gn's range; -1 for
-    # G3, where log1p(deff) in dm_to_binom_params breaks.
+    # G3, where log1p(deff) in deff_to_binom_params breaks.
     floor = (
         -np.asarray(model.lbda[1])
         if model.gn_order == 2
@@ -186,8 +186,8 @@ def init_xlm_from_data(
     if rescale:
         xlm = XlmParams(real=xlm.real / rms, imag=xlm.imag / rms)
 
-    deff = model.x2deff(xlm, theta)
-    n, _ = model.dm_to_binom_params(deff, theta, mask_output=True)
+    deff = model.xlm_to_deff(xlm, theta)
+    n, _ = model.deff_to_binom_params(deff, theta, mask_output=True)
     margin = np.asarray(n) + 1 - model.Ng_obs
 
     if verbose:
