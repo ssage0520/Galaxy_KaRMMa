@@ -44,12 +44,12 @@ class WhitenedSampler:
     def dense_theta_imm(
         self,
         position: KarmmaPosition,
-        tol: float = 1e-3,
+        tol: float = 3e-2,
         maxiter: int = 300,
         kappa_max: float = 1e9,
-        verbose: bool = True,
+        marginalize: bool = False,
     ) -> np.ndarray:
-        """Compute a dense theta-only covariance-like matrix via Schur complement + CG.
+        """Compute a dense theta-only covariance-like matrix from the Hessian.
 
         Parameters
         ----------
@@ -57,14 +57,17 @@ class WhitenedSampler:
             Position to linearize around; both `position.xlm` and
             `position.theta` must be set.
         tol : float, optional
-            CG solver tolerance, by default 1e-3.
+            CG solver tolerance, by default 3e-2. Ignored unless
+            `marginalize` is True.
         maxiter : int, optional
-            CG solver maximum iterations, by default 300.
+            CG solver maximum iterations, by default 300. Ignored unless
+            `marginalize` is True.
         kappa_max : float, optional
             Maximum condition number enforced on the corrected matrix via
             eigenvalue-magnitude clipping, by default 1e9.
-        verbose : bool, optional
-            Whether to print progress and diagnostic statistics, by default True.
+        marginalize : bool, optional
+            Whether to marginalize over the xlm block via the Schur
+            complement, by default False. See Notes.
 
         Returns
         -------
@@ -74,10 +77,28 @@ class WhitenedSampler:
 
         Notes
         -----
-        Marginalizes over the xlm block with `n_theta` CG solves against
-        `H_xx`, then fixes the resulting indefinite `n_theta`×`n_theta`
-        Schur complement to positive-definite via `|λ|` eigenvalue
-        correction.
+        The indefinite `n_theta`×`n_theta` precision block is fixed to
+        positive-definite via `|λ|` eigenvalue correction, then inverted.
+
+        With `marginalize=False` (the default) the theta block of the full
+        Hessian, `H_bb`, is used directly, costing only the `n_theta`
+        b-indicator HVPs. This is the object a *block-diagonal* whitening
+        calls for: `_build_reparam` rescales theta and leaves xlm alone, so
+        the theta block of the preconditioned Hessian is
+        `M**0.5 @ H_bb @ M**0.5`, which `M = H_bb^-1` normalizes exactly.
+
+        With `marginalize=True` the xlm block is marginalized out via the
+        Schur complement `H_bb - H_bx @ H_xx^-1 @ H_bx.T`, requiring
+        `n_theta` further CG solves against `H_xx` and dominating the
+        runtime. That is the correct object for sampling theta with xlm
+        integrated out, or for a block-*triangular* whitening that also
+        shifts xlm by `-H_xx^-1 @ H_xb @ dtheta`, neither of which happens
+        here, and it measures as the worse whitening on the G3 coverage
+        runs. The marginal correction nearly cancels `H_bb` along the soft
+        directions, so the subtraction lands indefinite and the `|λ|`
+        correction then invents a scale for those directions; tightening
+        `tol` does not help, the error being cancellation rather than
+        tolerance.
         """
         n_theta = len(ThetaParams._fields) * self.model.Nbins
 
@@ -102,10 +123,7 @@ class WhitenedSampler:
             v_full = jnp.zeros(N_full).at[:n_x].set(vx)
             return _hvp(v_full)[:n_x]
 
-        if verbose:
-            print(
-                f"dense_theta_imm: step 1 — {n_theta} b-indicator HVPs ...", flush=True
-            )
+        print(f"dense_theta_imm: {n_theta} b-indicator HVPs ...", flush=True)
         # HVP against unit vector e_{n_x+i} extracts the (n_x+i)-th row of the
         # full Hessian; stacking one row per theta index gives every row of
         # the full Hessian that touches the theta block.
@@ -115,41 +133,44 @@ class WhitenedSampler:
         H_bb_est = rows_b[:, n_x:]
         H_bx_est = rows_b[:, :n_x]
 
-        if verbose:
-            n_finite = int(jnp.sum(jnp.all(jnp.isfinite(rows_b), axis=1)))
-            abs_rows_b = jnp.abs(rows_b)
+        n_finite = int(jnp.sum(jnp.all(jnp.isfinite(rows_b), axis=1)))
+        abs_rows_b = jnp.abs(rows_b)
+        print(
+            f"  HVP finiteness: {n_finite}/{n_theta} finite  |  "
+            f"|HVP| range: min={abs_rows_b.min():.2e} max={abs_rows_b.max():.2e}"
+        )
+        if marginalize:
             print(
-                f"  HVP finiteness: {n_finite}/{n_theta} finite  |  "
-                f"|HVP| range: min={abs_rows_b.min():.2e} max={abs_rows_b.max():.2e}"
-            )
-            print(
-                f"dense_theta_imm: step 2 — {n_theta} CG solves "
+                f"dense_theta_imm: marginalizing over xlm — {n_theta} CG solves "
                 f"(tol={tol}, maxiter={maxiter}) ...",
                 flush=True,
             )
-        X = jnp.stack(
-            [
-                cg(_hvp_xx, H_bx_est[j], tol=tol, maxiter=maxiter)[0]
-                for j in range(n_theta)
-            ]
-        )
 
-        # Schur complement of the theta block: H_bb - H_bx @ Hxx^-1 @ H_bx^T,
-        # with X solving Hxx @ X = H_bx^T via CG above.
-        precision_bb = H_bb_est - H_bx_est @ X.T
+        if marginalize:
+            X = jnp.stack(
+                [
+                    cg(_hvp_xx, H_bx_est[j], tol=tol, maxiter=maxiter)[0]
+                    for j in range(n_theta)
+                ]
+            )
+            # Schur complement of the theta block: H_bb - H_bx @ Hxx^-1 @ H_bx^T,
+            # with X solving Hxx @ X = H_bx^T via CG above.
+            precision_bb = H_bb_est - H_bx_est @ X.T
+        else:
+            precision_bb = H_bb_est
 
-        if verbose:
-            evals = np.array(jnp.linalg.eigvalsh(precision_bb))
+        evals = np.array(jnp.linalg.eigvalsh(precision_bb))
+        if marginalize:
             resid = np.array(
                 jax.vmap(
                     lambda x, r: jnp.linalg.norm(_hvp_xx(x) - r) / jnp.linalg.norm(r)
                 )(X, H_bx_est)
             )
             print(f"  CG rel residuals: max={resid.max():.2e}  mean={resid.mean():.2e}")
-            print(
-                f"  Schur eigenvalues: min={evals.min():.4e}  max={evals.max():.4e}  "
-                f"negative={np.sum(evals < 0)}"
-            )
+        print(
+            f"  precision eigenvalues: min={evals.min():.4e}  "
+            f"max={evals.max():.4e}  negative={np.sum(evals < 0)}"
+        )
 
         S = 0.5 * (precision_bb + precision_bb.T)
         w, U = jnp.linalg.eigh(S)
@@ -168,10 +189,10 @@ class WhitenedSampler:
     def _build_reparam(
         self,
         initial_position: KarmmaPosition,
-        tol: float = 1e-3,
+        tol: float = 3e-2,
         maxiter: int = 300,
         kappa_max: float = 1e9,
-        verbose: bool = True,
+        marginalize: bool = False,
     ) -> None:
         """Compute and store the whitening eigenbasis transform for theta.
 
@@ -184,16 +205,16 @@ class WhitenedSampler:
             Position to build the reparametrization around; forwarded to
             `dense_theta_imm`.
         tol : float, optional
-            Forwarded to `dense_theta_imm`, by default 1e-3.
+            Forwarded to `dense_theta_imm`, by default 3e-2.
         maxiter : int, optional
             Forwarded to `dense_theta_imm`, by default 300.
         kappa_max : float, optional
             Forwarded to `dense_theta_imm`, by default 1e9.
-        verbose : bool, optional
-            Forwarded to `dense_theta_imm`, by default True.
+        marginalize : bool, optional
+            Forwarded to `dense_theta_imm`, by default False.
         """
         dense_theta_matrix = self.dense_theta_imm(
-            initial_position, tol, maxiter, kappa_max, verbose
+            initial_position, tol, maxiter, kappa_max, marginalize
         )
         self.w, self.V = jnp.linalg.eigh(jnp.asarray(dense_theta_matrix))
         self.theta0 = initial_position.theta
