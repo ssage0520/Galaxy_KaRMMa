@@ -21,7 +21,7 @@ import h5py as h5
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from karmma import ForwardModel, KarmmaConfig
-from karmma.initialization import fit_bias, init_xlm_from_data
+from karmma.initialization import init_xlm, refine_theta
 from karmma.samplers import MCLMCSampler, NUTSSampler
 from karmma.structs import (
     KarmmaPosition,
@@ -51,15 +51,20 @@ print(
     f"Model initialized (nside={model.Nside}, nbins={model.Nbins}, n_modes={model.n_modes})."
 )
 
-# config defers `xlm_init: data` to here, since building it needs the model's
+# config defers `xlm_init: cg` to here, since building it needs the model's
 # CL_G/L_G, which only exist once the ForwardModel is constructed.
-b_fit = None
-if io.initial_position.xlm is None:
-    b_fit = fit_bias(model)
-    xlm = init_xlm_from_data(model, io.initial_position.theta, b=b_fit)
-    initial_position = KarmmaPosition(xlm=xlm, theta=io.initial_position.theta)
-else:
-    initial_position = io.initial_position
+xlm = io.initial_position.xlm
+theta = io.initial_position.theta
+
+if xlm is None:
+    # fold_in keeps this decorrelated from the stream handed to the sampler
+    # while staying reproducible from mcmc.seed alone.
+    xlm = init_xlm(model, theta, jax.random.fold_in(mcmc.key, 1))
+
+if io.theta_init == "fit":
+    theta = refine_theta(model, xlm, theta)
+
+initial_position = KarmmaPosition(xlm=xlm, theta=theta)
 
 initial_imm = np.ones(jax.flatten_util.ravel_pytree(initial_position)[0].shape[0])
 
@@ -113,8 +118,8 @@ with h5.File(os.path.join(io.output_dir, "samples.h5"), "w") as f:
 with h5.File(os.path.join(io.output_dir, "mcmc_metadata.h5"), "w") as f:
     # run info
     f["seed"] = np.array(mcmc.seed)
-    if b_fit is not None:
-        f["xlm_init_bias"] = np.array(b_fit)
+    f["xlm_init"] = io.xlm_init
+    f["theta_init"] = io.theta_init
 
     if isinstance(mcmc, NutsConfig):
         # blackjax's window_adaptation returns tuned params as a plain dict

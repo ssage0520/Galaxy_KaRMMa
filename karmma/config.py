@@ -139,7 +139,8 @@ class KarmmaConfig:
         Raises
         ------
         ValueError
-            If `xlm_init` is not `"data"` or `"truth"`; if
+            If `xlm_init` is not `"cg"` or `"truth"`; if
+            `theta_init` is not `"given"` or `"fit"`; if
             `xlm_init: truth` is requested but `datafile` has no
             `true_xlm` group; if `init_file` is provided but missing a
             `theta` group; or if no theta source resolves at all.
@@ -147,15 +148,29 @@ class KarmmaConfig:
         Notes
         -----
         `xlm` priority order: `init_file`'s `xlm` group, then whatever
-        `xlm_init` selects (default `"data"`). `xlm_init: truth` takes
-        `datafile`'s `true_xlm`; `xlm_init: data` leaves `xlm` as `None`,
-        deferring to `init_xlm_from_data` in `run_karmma.py` — building it
-        needs a `ForwardModel`, which does not exist yet at config time.
+        `xlm_init` selects (default `"cg"`). `xlm_init: truth` takes
+        `datafile`'s `true_xlm`; `"cg"` leaves `xlm` as `None`, deferring
+        construction to `run_karmma.py` — building it needs a
+        `ForwardModel`, which does not exist yet at config time.
 
-        `"data"` is the default because it is the only option available
-        for real data, and starting a mock run at its own truth biases
-        coverage tests. Set `xlm_init: truth` to recover the old
-        behaviour.
+        `"cg"` calls `karmma.initialization.init_xlm`, which inverts
+        `dg_obs` for a seed and then Wiener-filters it into an approximate
+        posterior draw. That refinement is not optional: the raw inversion
+        overfits the shot noise by ~3e4 nats and drives `refine_theta` to
+        push `mu0` onto the support boundary. `"cg"` is the only option
+        available for real data; starting a mock run at its own truth also
+        biases coverage tests, so `xlm_init: truth` exists only to recover
+        the original behaviour.
+
+        `theta_init` (default `"fit"`) chooses whether the resolved theta
+        is refined by `refine_theta` at the initial `xlm` or used as-is.
+        Fitting moves theta away from whatever was supplied, trading
+        accuracy for consistency with `xlm` — and that pairing, not the
+        accuracy, is what the whitening Hessian is sensitive to: measured
+        on G3 coverage mocks, refining reaches the same residual
+        correlation as whitening at the true position, while using a
+        supplied truth unrefined does measurably worse. Set
+        `theta_init: given` to use the supplied value untouched.
 
         `theta` priority order: `init_file`'s `theta` group, then
         `datafile`'s `true_theta` group, then `theta_file`'s `theta`
@@ -206,10 +221,10 @@ class KarmmaConfig:
             print("Pixel window: none (warning: this may bias your results)")
 
         # --- xlm (priority order) ---
-        xlm_init = cfg.get("xlm_init", "data")
-        if xlm_init not in ("data", "truth"):
+        xlm_init = cfg.get("xlm_init", "cg")
+        if xlm_init not in ("cg", "truth"):
             raise ValueError(
-                f"io.xlm_init must be 'data' or 'truth', got {xlm_init!r}."
+                f"io.xlm_init must be 'cg' or 'truth', got {xlm_init!r}."
             )
 
         # `init_file and ...` short-circuits safely when init_file is None
@@ -220,14 +235,20 @@ class KarmmaConfig:
             if not _h5_has(datafile, "true_xlm"):
                 raise ValueError(
                     f"io.xlm_init is 'truth' but {datafile} has no 'true_xlm' "
-                    "group. Use xlm_init: data to build the initial xlm from "
+                    "group. Use xlm_init: cg to build the initial xlm from "
                     "the observed counts instead."
                 )
             xlm = _load_xlm(datafile, "true_xlm")
             print("xlm init: truth from datafile")
         else:
-            xlm = None  # signals run_karmma.py to call init_xlm_from_data()
-            print("xlm init: from data (deferred until the model is built)")
+            xlm = None  # signals run_karmma.py to build it from dg_obs
+            print(f"xlm init: {xlm_init} (deferred until the model is built)")
+
+        theta_init = cfg.get("theta_init", "fit")
+        if theta_init not in ("given", "fit"):
+            raise ValueError(
+                f"io.theta_init must be 'given' or 'fit', got {theta_init!r}."
+            )
 
         # --- theta (priority order) ---
         # validate init_file completeness before falling through
@@ -264,6 +285,7 @@ class KarmmaConfig:
             initial_position=initial_position,
             save_maps=save_maps,
             xlm_init=xlm_init,
+            theta_init=theta_init,
         )
 
     def _resolve_seed_and_key(self, cfg: dict) -> tuple[int, jax.Array]:

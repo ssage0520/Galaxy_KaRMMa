@@ -249,16 +249,21 @@ class IoConfig(NamedTuple):
         or `None` if not applied.
     initial_position : KarmmaPosition
         Starting position for sampling. Its `xlm` is `None` when
-        `xlm_init` is `"data"`, since building it needs a `ForwardModel`
+        `xlm_init` is `"cg"`, since building it needs a `ForwardModel`
         that does not exist yet at config time.
     save_maps : bool
         Whether `xlm` is retained in memory during sampling and written to
         `samples.h5`; `theta` is always saved regardless.
     xlm_init : str
-        How `initial_position.xlm` is chosen: `"data"` to construct it
-        from `dg_obs` (see `karmma.initialization.init_xlm_from_data`), or
-        `"truth"` to take the datafile's `true_xlm`. Ignored when
-        `init_file` supplies an `xlm` group, which outranks both.
+        How `initial_position.xlm` is chosen: `"cg"` to construct an
+        approximate posterior draw from `dg_obs` (see
+        `karmma.initialization.init_xlm`), or `"truth"` to take the
+        datafile's `true_xlm`. Ignored when `init_file` supplies an `xlm`
+        group, which outranks both.
+    theta_init : str
+        How `initial_position.theta` is finalized: `"fit"` to refine it at
+        the initial `xlm` with `karmma.initialization.refine_theta`, or
+        `"given"` to use the resolved value as-is.
     """
 
     input_dir: str
@@ -272,3 +277,4 @@ class IoConfig(NamedTuple):
     initial_position: KarmmaPosition
     save_maps: bool
     xlm_init: str
+    theta_init: str

@@ -4,8 +4,8 @@ from .config import KarmmaConfig
 from .forward_model import ForwardModel
 from .initialization import (
     InfeasibleInitError,
-    fit_bias,
-    init_xlm_from_data,
+    init_xlm,
+    refine_theta,
 )
 from .structs import (
     KarmmaPosition,
@@ -20,8 +20,8 @@ __all__ = [
     "KarmmaConfig",
     "ForwardModel",
     "InfeasibleInitError",
-    "fit_bias",
-    "init_xlm_from_data",
+    "init_xlm",
+    "refine_theta",
     "KarmmaPosition",
     "MCLMCInfo",
     "NUTSInfo",
