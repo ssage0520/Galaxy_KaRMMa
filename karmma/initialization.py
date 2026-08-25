@@ -275,7 +275,12 @@ def init_xlm(
             model.xlm_to_deff(draw, theta), theta, mask_output=True
         )
         margin = np.asarray(n) + 1 - model.Ng_obs
-        n_bad = int((margin <= 0).sum())
+        # `~(margin > 0)` rather than `margin <= 0`: a non-finite margin must count as a
+        # failure, and `NaN <= 0` is False. Without this a NaN field is returned as
+        # feasible, and the caller only finds out when refine_theta reports log_prob is
+        # not finite -- several steps from the actual cause.
+        n_nonfinite = int((~np.isfinite(margin)).sum())
+        n_bad = int((~(margin > 0)).sum())
 
         rms = float(
             jnp.sqrt(
@@ -286,7 +291,8 @@ def init_xlm(
         )
         print(
             f"  attempt {attempt + 1}: rms {rms:.4f}, support margin min "
-            f"{margin.min():+.2f}, median {np.median(margin):.1f}"
+            f"{np.nanmin(margin):+.2f}, median {np.nanmedian(margin):.1f}"
+            + (f", NON-FINITE at {n_nonfinite} terms" if n_nonfinite else "")
         )
         if not n_bad:
             print(
@@ -305,7 +311,8 @@ def init_xlm(
     raise InfeasibleInitError(
         f"CG constrained realization fell outside the likelihood's support on all "
         f"{max_tries} attempts: {n_bad} of {margin.size} masked pixel-bin terms "
-        f"have Ng_obs >= n + 1, worst margin {margin.min():+.2f}.\n"
+        f"have Ng_obs >= n + 1 (or a non-finite margin, at {n_nonfinite} of them), "
+        f"worst finite margin {np.nanmin(margin):+.2f}.\n"
         f"  The Wiener mean itself is reusable, so this is the prior draw pushing "
         f"the field outside the support. Check that theta is sensible and that the "
         f"seed was feasible to begin with."
