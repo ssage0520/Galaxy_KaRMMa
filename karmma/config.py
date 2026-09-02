@@ -5,6 +5,7 @@ import os
 import h5py as h5
 import healpy as hp
 import jax
+import jax.numpy as jnp
 import numpy as np
 import yaml
 
@@ -39,6 +40,21 @@ def _load_theta(path: str, group: str) -> ThetaParams:
         )
 
 
+def _load_whitening(path: str) -> tuple[np.ndarray, np.ndarray, ThetaParams]:
+    """Load `(V, w, theta0)` from a `theta_reparam` group, as written to `mcmc_metadata.h5`."""
+    if not _h5_has(path, "theta_reparam"):
+        raise ValueError(f"io.whitening {path} has no 'theta_reparam' group.")
+    with h5.File(path, "r") as f:
+        grp = f["theta_reparam"]
+        return (
+            grp["V"][:],
+            grp["w"][:],
+            ThetaParams(
+                **{field: grp[f"theta0/{field}"][:] for field in ThetaParams._fields}
+            ),
+        )
+
+
 class KarmmaConfig:
     """Load and validate a KaRMMa run configuration from a YAML file.
 
@@ -57,11 +73,9 @@ class KarmmaConfig:
         Point-transform/survey setup: number of tomographic bins, HEALPix
         resolution, and the `G_N` point-transform parameters/order.
     io : IoConfig
-        Input/output configuration: data paths, the observed maps and
-        mask loaded from `datafile`, the target power spectrum and pixel
-        window, and the resolved initial sampling position (from an init
-        file, truth in the mock, or left `None` for random
-        initialization).
+        Input/output configuration: data paths, the observed maps and mask
+        loaded from `datafile`, the target power spectrum and pixel window,
+        and the initial sampling position.
     """
 
     def __init__(self, config_file: str) -> None:
@@ -69,7 +83,9 @@ class KarmmaConfig:
             config = yaml.safe_load(f)
         self.mcmc = self._set_mcmc(config["mcmc"])
         self.analysis = self._set_analysis(config["analysis"])
-        self.io = self._set_io(config["io"], nside=self.analysis.nside)
+        self.io = self._set_io(
+            config["io"], nside=self.analysis.nside, nbins=self.analysis.nbins
+        )
 
     def _set_analysis(self, cfg: dict) -> AnalysisConfig:
         """Build an `AnalysisConfig` from the `analysis` config section."""
@@ -114,13 +130,12 @@ class KarmmaConfig:
         lbda = np.array([np.asarray(cfg[k].split(","), dtype=float) for k in keys])
         return lbda, gn_order
 
-    def _set_io(self, cfg: dict, nside: int) -> IoConfig:
+    def _set_io(self, cfg: dict, nside: int, nbins: int) -> IoConfig:
         """Build an `IoConfig` from the `io` config section.
 
         Loads the observed maps, target power spectrum, and pixel window
-        (`datafile`/`cl_file`/`pixwin`, all resolved relative to
-        `input_dir`), then resolves `xlm`/`theta` initial values by
-        priority order (see Notes).
+        (`datafile`/`cl_file`/`pixwin`, all resolved relative to `input_dir`),
+        and resolves the initial position and whitening.
 
         Parameters
         ----------
@@ -130,6 +145,9 @@ class KarmmaConfig:
             HEALPix resolution, from `AnalysisConfig.nside` — needed only
             if `pixwin: healpix` requests an analytically-computed pixel
             window.
+        nbins : int
+            Number of tomographic bins, from `AnalysisConfig.nbins` — used to
+            broadcast scalar `theta_guess` entries.
 
         Returns
         -------
@@ -139,54 +157,41 @@ class KarmmaConfig:
         Raises
         ------
         ValueError
-            If `xlm_init` is not `"cg"` or `"truth"`; if
-            `theta_init` is not `"given"` or `"fit"`; if
-            `xlm_init: truth` is requested but `datafile` has no
-            `true_xlm` group; if `init_file` is provided but missing a
-            `theta` group; or if no theta source resolves at all.
+            On unrecognized `io` keys, a negative `init_passes`, an
+            `init_position` file with neither group, a derived `theta` with no
+            `theta_guess`, or a supplied `whitening` alongside an incomplete
+            position or nonzero `init_passes`.
 
         Notes
         -----
-        `xlm` priority order: `init_file`'s `xlm` group, then whatever
-        `xlm_init` selects (default `"cg"`). `xlm_init: truth` takes
-        `datafile`'s `true_xlm`; `"cg"` leaves `xlm` as `None`, deferring
-        construction to `run_karmma.py` — building it needs a
-        `ForwardModel`, which does not exist yet at config time.
-
-        `"cg"` calls `karmma.initialization.init_xlm`, which inverts
-        `dg_obs` for a seed and then Wiener-filters it into an approximate
-        posterior draw. That refinement is not optional: the raw inversion
-        overfits the shot noise by ~3e4 nats and drives `refine_theta` to
-        push `mu0` onto the support boundary. `"cg"` is the only option
-        available for real data; starting a mock run at its own truth also
-        biases coverage tests, so `xlm_init: truth` exists only to recover
-        the original behaviour.
-
-        `theta_init` (default `"fit"`) chooses whether the resolved theta
-        is refined by `refine_theta` at the initial `xlm` or used as-is.
-        Fitting moves theta away from whatever was supplied, trading
-        accuracy for consistency with `xlm` — and that pairing, not the
-        accuracy, is what the whitening Hessian is sensitive to: measured
-        on G3 coverage mocks, refining reaches the same residual
-        correlation as whitening at the true position, while using a
-        supplied truth unrefined does measurably worse. Set
-        `theta_init: given` to use the supplied value untouched.
-
-        `theta` priority order: `init_file`'s `theta` group, then
-        `datafile`'s `true_theta` group, then `theta_file`'s `theta`
-        group, then a `ValueError` if none resolve. Unlike `xlm`, `theta`
-        has no random-init fallback: it's always part of the sampled
-        position, and `WhitenedSampler` builds its whitening eigenbasis
-        around the initial theta, so a concrete value must resolve here.
-
-        An `init_file` that has `xlm` but no `theta` is rejected up front,
-        before the priority chain runs, rather than being silently
-        bounced to `true_theta`/`theta_file` — resuming from a partial
-        init file is far more likely to be a mistake than an intent.
+        `init_position` is `auto` or a path to an HDF5 file with an `xlm`
+        group, a `theta` group, or both; `run_karmma.py` derives whatever is
+        missing. `whitening` is `auto` or a path to a file with a
+        `theta_reparam` group.
 
         `save_maps` (default `True`) controls whether `xlm` is retained
         during sampling and saved to `samples.h5`; `theta` is always saved.
         """
+        # Reject unknown keys: silently ignoring a retired knob like `xlm_init`
+        # would change what a run does without saying so.
+        known = {
+            "input_dir",
+            "output_dir",
+            "datafile",
+            "cl_file",
+            "pixwin",
+            "save_maps",
+            "init_position",
+            "init_passes",
+            "theta_guess",
+            "whitening",
+        }
+        unknown = set(cfg) - known
+        if unknown:
+            raise ValueError(
+                f"Unrecognized io keys: {sorted(unknown)}. Valid keys are {sorted(known)}."
+            )
+
         input_dir = cfg["input_dir"]
         output_dir = cfg["output_dir"]
         save_maps = bool(cfg.get("save_maps", True))
@@ -198,8 +203,6 @@ class KarmmaConfig:
             return os.path.join(input_dir, value) if value else None
 
         datafile = _resolve("datafile")
-        init_file = _resolve("init_file")
-        theta_file = _resolve("theta_file")
 
         with h5.File(datafile, "r") as f:
             dg_obs = f["dg_obs"][:]
@@ -220,58 +223,55 @@ class KarmmaConfig:
             pixwin = None
             print("Pixel window: none (warning: this may bias your results)")
 
-        # --- xlm (priority order) ---
-        xlm_init = cfg.get("xlm_init", "cg")
-        if xlm_init not in ("cg", "truth"):
-            raise ValueError(
-                f"io.xlm_init must be 'cg' or 'truth', got {xlm_init!r}."
-            )
+        # --- initial position ---
+        init_passes = int(cfg.get("init_passes", 0))
+        if init_passes < 0:
+            raise ValueError(f"io.init_passes must be >= 0, got {init_passes}.")
 
-        # `init_file and ...` short-circuits safely when init_file is None
-        if init_file and _h5_has(init_file, "xlm"):
-            xlm = _load_xlm(init_file, "xlm")
-            print(f"xlm init: {init_file}")
-        elif xlm_init == "truth":
-            if not _h5_has(datafile, "true_xlm"):
+        init_position = cfg.get("init_position", "auto")
+        if init_position == "auto":
+            xlm, theta = None, None
+            print("init position: auto (theta-free field, deferred until the model exists)")
+        else:
+            path = _resolve("init_position")
+            has_xlm, has_theta = _h5_has(path, "xlm"), _h5_has(path, "theta")
+            if not (has_xlm or has_theta):
                 raise ValueError(
-                    f"io.xlm_init is 'truth' but {datafile} has no 'true_xlm' "
-                    "group. Use xlm_init: cg to build the initial xlm from "
-                    "the observed counts instead."
+                    f"io.init_position {path} has neither an 'xlm' nor a 'theta' group. "
+                    "Use init_position: auto to build both from the data."
                 )
-            xlm = _load_xlm(datafile, "true_xlm")
-            print("xlm init: truth from datafile")
-        else:
-            xlm = None  # signals run_karmma.py to build it from dg_obs
-            print(f"xlm init: {xlm_init} (deferred until the model is built)")
+            xlm = _load_xlm(path, "xlm") if has_xlm else None
+            theta = _load_theta(path, "theta") if has_theta else None
+            supplied = " + ".join(
+                n for n, present in (("xlm", has_xlm), ("theta", has_theta)) if present
+            )
+            print(f"init position: {path} ({supplied})")
 
-        theta_init = cfg.get("theta_init", "fit")
-        if theta_init not in ("given", "fit"):
+        theta_guess = self._set_theta_guess(cfg, nbins)
+        if theta is None and theta_guess is None:
             raise ValueError(
-                f"io.theta_init must be 'given' or 'fit', got {theta_init!r}."
+                "theta must be derived (io.init_position supplies none), which needs "
+                "io.theta_guess as the starting point for refine_theta."
             )
 
-        # --- theta (priority order) ---
-        # validate init_file completeness before falling through
-        if init_file and not _h5_has(init_file, "theta"):
-            raise ValueError("init_file provided but missing 'theta' group.")
-        if init_file and _h5_has(init_file, "theta"):
-            theta = _load_theta(init_file, "theta")
-            print(f"theta init: {init_file}")
-        elif _h5_has(datafile, "true_theta"):
-            theta = _load_theta(datafile, "true_theta")
-            print("theta init: truth from datafile")
-        elif theta_file:
-            # theta_file is an HDF5 file with a 'theta/' group
-            theta = _load_theta(theta_file, "theta")
-            print(f"theta init: {theta_file}")
+        # --- whitening ---
+        whitening_cfg = cfg.get("whitening", "auto")
+        if whitening_cfg == "auto":
+            whitening = None
         else:
-            raise ValueError(
-                "No theta source found. Provide init_file with a 'theta/' group, "
-                "a theta_file (HDF5 with 'theta/' group), or ensure datafile contains 'true_theta/'."
-            )
-
-        # --- assemble ---
-        initial_position = KarmmaPosition(xlm=xlm, theta=theta)
+            # A supplied basis is only valid at the position it was built for.
+            if xlm is None or theta is None:
+                raise ValueError(
+                    "io.whitening requires io.init_position to supply both 'xlm' and "
+                    "'theta'; a derived position would not match the supplied basis."
+                )
+            if init_passes:
+                raise ValueError(
+                    f"io.whitening is incompatible with io.init_passes={init_passes}: "
+                    "the extra passes move the position away from the supplied basis."
+                )
+            whitening = _load_whitening(_resolve("whitening"))
+            print(f"whitening: {_resolve('whitening')}")
 
         return IoConfig(
             input_dir=input_dir,
@@ -282,11 +282,33 @@ class KarmmaConfig:
             N_bar=N_bar,
             cl=cl,
             pixwin=pixwin,
-            initial_position=initial_position,
+            initial_position=KarmmaPosition(xlm=xlm, theta=theta),
             save_maps=save_maps,
-            xlm_init=xlm_init,
-            theta_init=theta_init,
+            init_passes=init_passes,
+            theta_guess=theta_guess,
+            whitening=whitening,
         )
+
+    @staticmethod
+    def _set_theta_guess(cfg: dict, nbins: int) -> ThetaParams | None:
+        """Parse `io.theta_guess`: each field a scalar or `nbins` comma-separated values."""
+        raw = cfg.get("theta_guess")
+        if raw is None:
+            return None
+        missing = set(ThetaParams._fields) - set(raw)
+        if missing:
+            raise ValueError(f"io.theta_guess is missing fields: {sorted(missing)}.")
+        values = {}
+        for field in ThetaParams._fields:
+            arr = np.asarray(str(raw[field]).split(","), dtype=float)
+            if arr.size == 1:
+                arr = np.full(nbins, arr[0])
+            if arr.size != nbins:
+                raise ValueError(
+                    f"io.theta_guess.{field} has {arr.size} values, expected 1 or {nbins}."
+                )
+            values[field] = jnp.asarray(arr)
+        return ThetaParams(**values)
 
     def _resolve_seed_and_key(self, cfg: dict) -> tuple[int, jax.Array]:
         """Resolve the mcmc config's seed (or generate one) into `(seed, PRNGKey(seed))`."""

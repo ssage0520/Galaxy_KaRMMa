@@ -213,11 +213,28 @@ class WhitenedSampler:
         marginalize : bool, optional
             Forwarded to `dense_theta_imm`, by default False.
         """
+        if self.V is not None:
+            print("theta whitening: supplied externally, skipping dense_theta_imm")
+            return
         dense_theta_matrix = self.dense_theta_imm(
             initial_position, tol, maxiter, kappa_max, marginalize
         )
         self.w, self.V = jnp.linalg.eigh(jnp.asarray(dense_theta_matrix))
         self.theta0 = initial_position.theta
+
+    def set_whitening(
+        self, V: np.ndarray, w: np.ndarray, theta0: ThetaParams
+    ) -> None:
+        """Install a precomputed whitening basis, bypassing `_build_reparam`.
+
+        Parameters
+        ----------
+        V, w : np.ndarray
+            Eigenvectors and eigenvalues, as `_build_reparam` would produce.
+        theta0 : ThetaParams
+            The point the basis was expanded around.
+        """
+        self.V, self.w, self.theta0 = jnp.asarray(V), jnp.asarray(w), theta0
 
     def theta_to_phi(self, theta: ThetaParams) -> jnp.ndarray:
         """Transform physical theta to whitened phi, via the eigenbasis transform.

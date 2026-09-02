@@ -5,6 +5,7 @@ from .forward_model import ForwardModel
 from .initialization import (
     InfeasibleInitError,
     init_xlm,
+    init_xlm_theta_free,
     refine_theta,
 )
 from .structs import (
@@ -21,6 +22,7 @@ __all__ = [
     "ForwardModel",
     "InfeasibleInitError",
     "init_xlm",
+    "init_xlm_theta_free",
     "refine_theta",
     "KarmmaPosition",
     "MCLMCInfo",

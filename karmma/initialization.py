@@ -20,16 +20,18 @@ sampler's whitening is only representative at a self-consistent pair.
 
 import warnings
 
+import healpy as hp
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.flatten_util import ravel_pytree
 from jax.scipy.sparse.linalg import cg
+from scipy.special import legendre_p_all, roots_legendre
 from scipy.stats import kurtosis, skew
 
 from karmma.forward_model import ForwardModel
 from karmma.structs import KarmmaPosition, ThetaParams, XlmParams
-from karmma.transforms import map2alm
+from karmma.transforms import alm2map, map2alm
 
 # Keeps `dg_obs.min() / b` strictly inside the transform's domain rather than
 # exactly on its boundary, where G2's log diverges.
@@ -38,6 +40,10 @@ _FLOOR_MARGIN = 1e-3
 # Floor on the binomial variance used to build the CG noise weighting, guarding
 # the reciprocal where a pixel's predicted variance underflows.
 _VAR_FLOOR = 1e-30
+
+# Guard on band-power divisions in `fit_transfer_and_noise`, where an empty or
+# pathological band would otherwise divide by zero.
+_CL_FLOOR = 1e-30
 
 
 class InfeasibleInitError(RuntimeError):
@@ -431,3 +437,241 @@ def refine_theta(
         f"log_prob {f_start:.6e} -> {f:.6e})"
     )
     return unflatten(jnp.asarray(x))
+
+
+def _cl_bands(lmax: int, l_min: int = 25, min_width: int = 8) -> list[tuple[int, int]]:
+    """Log-spaced Cl bands, each at least `min_width` wide since the mask couples `dl ~ 5`.
+
+    Starts at `l_min = 25` because the mask-mean subtraction in
+    `fit_transfer_and_noise` suppresses power below that, by an amount the model
+    does not reproduce.
+    """
+    candidates = np.unique(np.round(np.geomspace(l_min, lmax + 1, 11)).astype(int))
+    edges = [int(candidates[0])]
+    for edge in candidates[1:]:
+        if edge - edges[-1] >= min_width:
+            edges.append(int(edge))
+    edges[-1] = lmax + 1
+    return list(zip(edges[:-1], edges[1:], strict=True))
+
+
+def fit_transfer_and_noise(
+    model: ForwardModel, n_template: int = 5, key: jax.Array | None = None
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fit the effective `dm -> dg` transfer and the noise level from `dg_obs` alone.
+
+    Parameters
+    ----------
+    model : ForwardModel
+        Supplies `dg_obs`, `mask`, `N_bar` and the point transform.
+    n_template : int, optional
+        Prior draws averaged for `Cl_dm`, by default 5.
+    key : jax.Array, optional
+        PRNG key for those draws. Defaults to a fixed key: the average is a
+        model quantity, so it needs no entropy from the caller.
+
+    Returns
+    -------
+    b_eff : np.ndarray
+        Effective transfer amplitude per bin, shape (Nbins,).
+    kappa : np.ndarray
+        `<1 - p>` weighted by mean count, per bin, shape (Nbins,).
+
+    Notes
+    -----
+    Fits, per bin, in inverse-variance-weighted bands from `_cl_bands`:
+
+        pseudoCl(dg_obs) = b_eff^2 * pseudoCl(Cl_dm) + f_sky * Omega_pix * kappa / N_bar
+
+    Linear in `(b_eff^2, N_ell)`, so one `lstsq` per bin; the terms separate
+    because the signal falls with `ell` while the noise is flat. Only one factor
+    of `N_bar` survives because `<mean_Ng>_mask = N_bar` identically, cancelling
+    one of the two from `dg = counts/N_bar - 1`.
+
+    `Cl_dm` comes from `n_template` prior draws, and the mask enters through the
+    identity `pseudo-Cl = Legendre[xi * xi_mask]`. The transfer's `ell`-shape is
+    held constant, so `b_eff` is its band-averaged amplitude.
+    """
+    lmax, pad = model.lmax, model.pad_lmax
+    mask = np.asarray(model.mask)
+    n_bar = np.asarray(model.N_bar)
+    f_sky = float(mask.mean())
+    omega_pix = 4.0 * np.pi / mask.size
+
+    mu, quad_w = roots_legendre(2 * pad)
+    legendre = legendre_p_all(pad, mu).squeeze()
+
+    def to_xi(cl: np.ndarray, lm: int) -> np.ndarray:
+        return ((2 * np.arange(lm + 1) + 1) * cl) @ legendre[: lm + 1] / (4 * np.pi)
+
+    def to_cl(xi: np.ndarray) -> np.ndarray:
+        return 2 * np.pi * (xi * quad_w) @ legendre[: lmax + 1].T
+
+    xi_mask = to_xi(hp.anafast(mask.astype(float), lmax=pad, use_pixel_weights=True), pad)
+
+    key = jax.random.PRNGKey(0) if key is None else key
+    cl_dm = np.zeros((model.Nbins, lmax + 1))
+    for t in range(n_template):
+        xlm = model.make_random_xlm(jax.random.fold_in(key, t))
+        ys = alm2map(model.apply_CL_G(model.unpack_xlm(xlm)), model.Nside, model.gen_lmax)
+        dm_lm = np.asarray(map2alm(model.gn_inv(ys, model.gn_order, model.lbda), lmax))
+        for i in range(model.Nbins):
+            cl_dm[i] += hp.alm2cl(np.ascontiguousarray(dm_lm[i])) / n_template
+
+    bands = _cl_bands(lmax)
+    n_mode = np.array([f_sky * np.sum(2 * np.arange(lo, hi) + 1) for lo, hi in bands])
+    b_eff, kappa = np.empty(model.Nbins), np.empty(model.Nbins)
+    for i in range(model.Nbins):
+        dg = np.where(mask, np.asarray(model.dg_obs[i]), 0.0)
+        cl_obs = hp.anafast(dg - dg[mask].mean() * mask, lmax=lmax)
+        signal = to_cl(to_xi(cl_dm[i], lmax) * xi_mask)
+        obs_b = np.array([cl_obs[lo:hi].mean() for lo, hi in bands])
+        signal_b = np.array([signal[lo:hi].mean() for lo, hi in bands])
+
+        weight = np.sqrt(n_mode / 2.0) / np.maximum(obs_b, _CL_FLOOR)
+        design = np.stack([signal_b, np.ones_like(signal_b)], axis=1) * weight[:, None]
+        (amplitude, n_ell), *_ = np.linalg.lstsq(design, obs_b * weight, rcond=None)
+
+        b_eff[i] = np.sqrt(max(float(amplitude), _CL_FLOOR))
+        kappa[i] = float(np.clip(n_ell * n_bar[i] / (f_sky * omega_pix), 1e-3, 1.0))
+    print(
+        f"  transfer fit: b_eff {np.array2string(b_eff, precision=3)}, "
+        f"kappa {np.array2string(kappa, precision=3)}"
+    )
+    return b_eff, kappa
+
+
+def init_xlm_theta_free(
+    model: ForwardModel,
+    key: jax.Array,
+    n_gauss_newton: int = 2,
+    cg_maxiter: int = 120,
+    cg_tol: float = 1e-8,
+) -> XlmParams:
+    """Build an initial `xlm` from `dg_obs` **without knowing `theta`**.
+
+    Parameters
+    ----------
+    model : ForwardModel
+        Supplies `dg_obs`, `mask`, `N_bar` and the theta-free part of the
+        forward map.
+    key : jax.Array
+        PRNG key for the constrained realization's prior and noise draws.
+    n_gauss_newton : int, optional
+        Gauss-Newton passes on the Wiener mean, by default 2.
+    cg_maxiter, cg_tol : optional
+        Passed to the CG solver.
+
+    Returns
+    -------
+    XlmParams
+        A constrained realization of the linearized posterior.
+
+    Raises
+    ------
+    InfeasibleInitError
+        If the draw comes back non-finite. Unlike `init_xlm` this cannot check
+        the likelihood's support, since the margin `n + 1 - Ng_obs` needs
+        `theta`; feasibility is the caller's to check once `refine_theta` has
+        run.
+
+    Notes
+    -----
+    Same structure as `init_xlm` — Gauss-Newton on the Wiener mean, then a
+    constrained realization — with the operator replaced by `b_eff *
+    xlm_to_dm` and the noise by per-pixel `N_obs * kappa / N_bar^2`, both from
+    `fit_transfer_and_noise`. Neither takes `theta`.
+
+    `A` still depends on the linearization point through `gn_inv`, hence the
+    Gauss-Newton passes. What the operator omits is the bias sigmoid, so a
+    subsequent `refine_theta` leaves `log_T` — the sigmoid's width — biased by
+    several sigma.
+
+    Staying in `xlm` space rather than `dm` space keeps the prior term exactly
+    `I` and `Cl_dm` out of the solve.
+
+    Follow with `refine_theta`, which is where `theta` comes from.
+    """
+    b_eff, kappa = fit_transfer_and_noise(model)
+
+    mask_row = jnp.asarray(model.mask)[None, :]
+    dg_obs = jnp.where(mask_row, jnp.asarray(model.dg_obs), 0.0)
+    transfer = jnp.asarray(b_eff)[:, None]
+
+    n_bar = np.asarray(model.N_bar)[:, None]
+    ng_obs = np.round((np.asarray(model.dg_obs) + 1.0) * n_bar)
+    # Off-mask pixels are floored to 1 rather than 0 only to keep the reciprocal
+    # finite; `weight` zeroes them anyway.
+    var = jnp.asarray(
+        np.maximum(np.where(np.asarray(model.mask), ng_obs, 1.0), 1.0)
+        * kappa[:, None]
+        / n_bar**2
+    )
+
+    def forward(xlm: XlmParams) -> jnp.ndarray:
+        """Predict `dg` from `xlm` with no `theta` anywhere."""
+        return transfer * model.xlm_to_dm(xlm)
+
+    def weight(residual: jnp.ndarray) -> jnp.ndarray:
+        """Apply `N^-1`, as a select so off-mask values cannot leak in."""
+        return jnp.where(mask_row, residual / var, 0.0)
+
+    def linearize_at(xlm: XlmParams) -> tuple:
+        """Build `A`, `A^T` and the solver at a linearization point."""
+        pred, jvp = jax.linearize(forward, xlm)
+        _, vjp = jax.vjp(forward, xlm)
+        jvp = jax.jit(jvp)
+        vjp_fn = jax.jit(lambda u: vjp(u)[0])
+
+        def solve(rhs: jnp.ndarray) -> XlmParams:
+            """Solve `(I + A^T N^-1 A) x = A^T N^-1 rhs`, matrix-free."""
+
+            def matvec(x: XlmParams) -> XlmParams:
+                data_term = vjp_fn(weight(jvp(x)))
+                return XlmParams(
+                    real=x.real + data_term.real, imag=x.imag + data_term.imag
+                )
+
+            out, _ = cg(matvec, vjp_fn(weight(rhs)), maxiter=cg_maxiter, tol=cg_tol)
+            return out
+
+        return pred, jvp, solve
+
+    print(
+        f"  theta-free CG: {n_gauss_newton} Gauss-Newton passes, "
+        f"{n_gauss_newton + 2} solves, cg_maxiter={cg_maxiter}"
+    )
+    # Gauss-Newton on the Wiener mean. The linearized data vector is
+    # d - f(x0) + A x0, which reduces to d when the model is already linear.
+    xlm = _seed_xlm(model)
+    for _ in range(n_gauss_newton):
+        pred, jvp, solve = linearize_at(xlm)
+        xlm = solve(dg_obs - pred + jvp(xlm))
+    pred, jvp, solve = linearize_at(xlm)
+    mean = solve(dg_obs - pred + jvp(xlm))
+
+    # Constrained realization: the mean alone suppresses every mode the data
+    # does not constrain, whereas sampling needs them at prior amplitude.
+    omega_key, eta_key = jax.random.split(key)
+    omega = model.make_random_xlm(omega_key)
+    eta = jnp.sqrt(var) * jax.random.normal(eta_key, shape=dg_obs.shape)
+    omega_wiener = solve(jvp(omega) + eta)
+    draw = XlmParams(
+        real=mean.real + omega.real - omega_wiener.real,
+        imag=mean.imag + omega.imag - omega_wiener.imag,
+    )
+
+    rms = float(
+        jnp.sqrt(
+            jnp.mean(jnp.concatenate([draw.real.ravel() ** 2, draw.imag.ravel() ** 2]))
+        )
+    )
+    print(f"  draw rms {rms:.4f} (prior: 1.0)")
+    if not np.isfinite(rms):
+        raise InfeasibleInitError(
+            "init_xlm_theta_free: the draw is non-finite. The transfer fit gave "
+            f"b_eff={np.array2string(b_eff, precision=3)}, "
+            f"kappa={np.array2string(kappa, precision=3)}; a b_eff far from ~1.7, or a "
+            "kappa pinned at a bound, points at the fit rather than the solve."
+        )
+    return draw

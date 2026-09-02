@@ -21,7 +21,7 @@ import h5py as h5
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from karmma import ForwardModel, KarmmaConfig
-from karmma.initialization import init_xlm, refine_theta
+from karmma.initialization import init_xlm, init_xlm_theta_free, refine_theta
 from karmma.samplers import MCLMCSampler, NUTSSampler
 from karmma.structs import (
     KarmmaPosition,
@@ -51,17 +51,24 @@ print(
     f"Model initialized (nside={model.Nside}, nbins={model.Nbins}, n_modes={model.n_modes})."
 )
 
-# config defers `xlm_init: cg` to here, since building it needs the model's
-# CL_G/L_G, which only exist once the ForwardModel is constructed.
+# Whatever `init_position` did not supply is built here rather than at config
+# time, since every builder needs a ForwardModel.
 xlm = io.initial_position.xlm
 theta = io.initial_position.theta
 
-if xlm is None:
-    # fold_in keeps this decorrelated from the stream handed to the sampler
-    # while staying reproducible from mcmc.seed alone.
+# fold_in keeps these decorrelated from the stream handed to the sampler while
+# staying reproducible from mcmc.seed alone.
+if xlm is None and theta is None:
+    xlm = init_xlm_theta_free(model, jax.random.fold_in(mcmc.key, 1))
+    theta = refine_theta(model, xlm, io.theta_guess)
+elif xlm is None:
     xlm = init_xlm(model, theta, jax.random.fold_in(mcmc.key, 1))
+elif theta is None:
+    theta = refine_theta(model, xlm, io.theta_guess)
 
-if io.theta_init == "fit":
+for extra_pass in range(io.init_passes):
+    print(f"init pass {extra_pass + 1} of {io.init_passes}")
+    xlm = init_xlm(model, theta, jax.random.fold_in(mcmc.key, 2 + extra_pass))
     theta = refine_theta(model, xlm, theta)
 
 initial_position = KarmmaPosition(xlm=xlm, theta=theta)
@@ -71,6 +78,8 @@ initial_imm = np.ones(jax.flatten_util.ravel_pytree(initial_position)[0].shape[0
 if isinstance(mcmc, NutsConfig):
     print("Sampler: NUTS")
     sampler = NUTSSampler(model)
+    if io.whitening is not None:
+        sampler.set_whitening(*io.whitening)
     states, infos, tuned_params, winfo = sampler.sample(
         key=mcmc.key,
         num_warmup=mcmc.num_warmup,
@@ -85,6 +94,8 @@ if isinstance(mcmc, NutsConfig):
 elif isinstance(mcmc, MclmcConfig):
     print("Sampler: MCLMC")
     sampler = MCLMCSampler(model)
+    if io.whitening is not None:
+        sampler.set_whitening(*io.whitening)
     states, infos, tuned_params = sampler.sample(
         key=mcmc.key,
         num_samples=mcmc.n_samples,
@@ -118,8 +129,8 @@ with h5.File(os.path.join(io.output_dir, "samples.h5"), "w") as f:
 with h5.File(os.path.join(io.output_dir, "mcmc_metadata.h5"), "w") as f:
     # run info
     f["seed"] = np.array(mcmc.seed)
-    f["xlm_init"] = io.xlm_init
-    f["theta_init"] = io.theta_init
+    f["init_passes"] = np.array(io.init_passes)
+    f["whitening_supplied"] = np.array(io.whitening is not None)
 
     if isinstance(mcmc, NutsConfig):
         # blackjax's window_adaptation returns tuned params as a plain dict
