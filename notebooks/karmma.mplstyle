@@ -1,0 +1,26 @@
+savefig.dpi: 100
+figure.dpi: 100
+font.size: 14
+
+# Use LaTeX for all text rendering
+text.usetex: True
+font.family: serif
+font.serif: Computer Modern
+
+# Ticks on all sides, pointing inward
+xtick.direction: in
+ytick.direction: in
+xtick.top: True
+ytick.right: True
+
+# Minor ticks
+xtick.minor.visible: True
+ytick.minor.visible: True
+
+# Slightly thicker axes and lines for retina displays
+axes.linewidth: 1.2
+lines.linewidth: 1.5
+
+# Legend
+legend.framealpha: 0.9
+legend.fontsize: 12
