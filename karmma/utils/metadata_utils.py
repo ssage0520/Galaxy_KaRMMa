@@ -97,15 +97,19 @@ def _read_scalar_or_array(dataset: h5.Dataset) -> int | float | bool | np.ndarra
     return dataset[()].item() if dataset.shape == () else dataset[:]
 
 
-def load_run(output_dir: str, mock_dg_path: str, label: str, color: str) -> dict:
+def load_run(
+    output_dir: str, mock_dg_path: str | None, label: str, color: str
+) -> dict:
     """Load one output directory into a run dict for the metadata notebook.
 
     Parameters
     ----------
     output_dir : str
         Directory containing `samples.h5` and `mcmc_metadata.h5`.
-    mock_dg_path : str
-        Path to the mock datafile holding `true_theta`.
+    mock_dg_path : str or None
+        Path to a mock datafile holding a `true_theta` group. Pass `None` when
+        the truth is supplied from elsewhere (e.g. a single shared
+        `theta_true.h5`); `true_theta` is then `None` in the returned dict.
     label : str
         Plot label for this run.
     color : str
@@ -118,7 +122,8 @@ def load_run(output_dir: str, mock_dg_path: str, label: str, color: str) -> dict
         `color`, `output_dir`, `type` ("nuts" or "mclmc"), `seed`,
         `step_size`, `inverse_mass_matrix`, `log_prob`, `theta_reparam`,
         `theta_samples`, `nbins`, `n_real`, `n_imag`, `n_samples`,
-        `true_theta`, `ess_theta`. `xlm_real`, `xlm_imag`, `ess_xlm_real`,
+        `true_theta` (`None` if `mock_dg_path` is `None`), `ess_theta`.
+        `xlm_real`, `xlm_imag`, `ess_xlm_real`,
         `ess_xlm_imag` are `None` for runs saved with `save_maps=False`
         (no `xlm` group in `samples.h5`). `extra` holds whatever's
         specific to the detected type (`NUTS_ONLY_KEYS` or
@@ -161,8 +166,11 @@ def load_run(output_dir: str, mock_dg_path: str, label: str, color: str) -> dict
         n_real = int(f["model_shape/n_real"][()])
         n_imag = int(f["model_shape/n_imag"][()])
 
-    with h5.File(mock_dg_path, "r") as f:
-        true_theta = _read_theta_group(f, "true_theta")  # (nbins, 6)
+    if mock_dg_path is None:
+        true_theta = None
+    else:
+        with h5.File(mock_dg_path, "r") as f:
+            true_theta = _read_theta_group(f, "true_theta")  # (nbins, 6)
 
     ess_xlm_real = (
         np.array(effective_sample_size(xlm_real[np.newaxis])) if has_xlm else None

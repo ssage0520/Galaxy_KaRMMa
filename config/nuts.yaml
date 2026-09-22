@@ -2,19 +2,30 @@ analysis:
     nbins: 2
     nside: 256
     gn:
-        a: 0.65397488, 0.52029803
-        b: 0.36216059, 0.24023071
-        c: 2.81548633, 2.25700888
+        alpha: 0.49821807, 0.39848170
+        beta: 0.52686442, 0.58211452
 
 io:
     input_dir: /spiff/ssage/karmma_data/LN_dg_RS_linmu/Inputs/
     output_dir: /spiff/ssage/karmma_data/LN_dg_RS_linmu/
     datafile: mock_dg.h5
-    init_file: null
-    theta_file: theta_true.h5
     cl_file: cl_sim42.npy
     pixwin: pixwin_256.npy
     save_maps: true
+
+    init_position: auto        # or a path to a file with 'xlm' and/or 'theta'
+    init_passes: 1             # extra init_xlm + refine_theta passes
+    whitening: auto            # or a path to a file with a 'theta_reparam' group
+
+    # Starting point for refine_theta when theta is derived. A scalar applies
+    # to every bin; a comma-separated list gives one value per bin.
+    theta_guess:
+        A_t: -0.10
+        log_T: -0.90
+        c: -0.35
+        log_R: 0.00
+        mu0: 0.013
+        a: 0.00
 
 mcmc:
     sampler: nuts

@@ -16,6 +16,11 @@ include = ["karmma*"]
 [tool.ruff]
 target-version = "py312"
 line-length = 88
+# respect-gitignore only skips ignored files during directory traversal. Editors and
+# pre-commit pass file paths explicitly, which bypasses it, so dev_notebooks needs a
+# real exclude plus force-exclude to stay unchecked there too.
+extend-exclude = ["dev_notebooks"]
+force-exclude = true
 
 [tool.ruff.lint]
 select = [

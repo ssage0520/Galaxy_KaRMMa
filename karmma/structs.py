@@ -56,8 +56,7 @@ class KarmmaPosition(NamedTuple):
     Attributes
     ----------
     xlm : XlmParams or None
-        Field coefficients; `None` when awaiting random initialization
-        (resolved in `run_karmma.py`).
+        Field coefficients; `None` when `run_karmma.py` must derive them.
     theta : ThetaParams
         Bias/nuisance parameters, sampled jointly with `xlm`.
     """
@@ -226,7 +225,7 @@ class IoConfig(NamedTuple):
     Attributes
     ----------
     input_dir : str
-        Directory `datafile`/`init_file`/`theta_file`/`cl_file`/`pixwin`
+        Directory `datafile`/`init_position`/`whitening`/`cl_file`/`pixwin`
         are all resolved relative to.
     output_dir : str
         Directory to write sampling output to.
@@ -248,10 +247,19 @@ class IoConfig(NamedTuple):
         Pixel window function, indexed by multipole (length >= lmax + 1),
         or `None` if not applied.
     initial_position : KarmmaPosition
-        Starting position for sampling.
+        Starting position for sampling. Either half is `None` when
+        `run_karmma.py` must derive it, which needs a `ForwardModel`.
     save_maps : bool
         Whether `xlm` is retained in memory during sampling and written to
         `samples.h5`; `theta` is always saved regardless.
+    init_passes : int
+        Extra `init_xlm` + `refine_theta` passes after the initial position.
+    theta_guess : ThetaParams or None
+        Starting point for `refine_theta` when `theta` is derived; `None` when
+        the config supplies `theta` directly.
+    whitening : tuple or None
+        `(V, w, theta0)` loaded from a file, or `None` to build it from the
+        initial position.
     """
 
     input_dir: str
@@ -264,3 +272,6 @@ class IoConfig(NamedTuple):
     pixwin: np.ndarray | None
     initial_position: KarmmaPosition
     save_maps: bool
+    init_passes: int
+    theta_guess: ThetaParams | None
+    whitening: tuple | None

@@ -88,7 +88,7 @@ class ForwardModel:
     _real_idx, _imag_idx : np.ndarray
         Indices selecting the free (non-redundant) real/imaginary
         harmonic modes of a real field, for packing/unpacking
-        `XlmParams` (see `get_xlm`).
+        `XlmParams` (see `unpack_xlm`).
     n_modes : int
         Total number of free `xlm` parameters (`len(_real_idx) +
         len(_imag_idx)`).
@@ -152,7 +152,7 @@ class ForwardModel:
 
         self.compute_CL_G()
 
-        # Precomputed so that get_xlm can be jit compiled — numpy, not jnp,
+        # Precomputed so that unpack_xlm can be jit compiled — numpy, not jnp,
         # so these static index constants are never confused with JAX tracers.
         self._real_idx = np.where(self.gen_ell > 1)[0]
         self._imag_idx = np.where((self.gen_ell > 1) & (self.gen_emm > 0))[0]
@@ -345,7 +345,7 @@ class ForwardModel:
         L_T = np.linalg.cholesky(CL_T)
         self.L_G = np.moveaxis(L_T, 0, 2)
 
-    def get_xlm(self, xlm: XlmParams) -> jnp.ndarray:
+    def unpack_xlm(self, xlm: XlmParams) -> jnp.ndarray:
         """Unpack `xlm`'s free real/imaginary parameters into the full complex harmonic array.
 
         Parameters
@@ -370,6 +370,34 @@ class ForwardModel:
         _imag = _imag.at[:, self._imag_idx].set(xlm.imag)
         return _real + 1j * _imag
 
+    def pack_xlm(self, xlm_array: jnp.ndarray) -> XlmParams:
+        """Pack a full complex harmonic array into the free real/imaginary parameters.
+
+        Inverse of `unpack_xlm`.
+
+        Parameters
+        ----------
+        xlm_array : jnp.ndarray
+            Full complex harmonic-coefficient array, shape
+            (Nbins, len(gen_ell)).
+
+        Returns
+        -------
+        XlmParams
+            The free coefficients at `_real_idx`/`_imag_idx`.
+
+        Notes
+        -----
+        The modes `unpack_xlm` leaves at zero — the monopole/dipole, and the
+        imaginary part of m=0 — are dropped rather than carried, so
+        `pack_xlm(unpack_xlm(x))` reproduces `x` exactly, while
+        `unpack_xlm(pack_xlm(a))` zeroes those entries of `a`.
+        """
+        return XlmParams(
+            real=xlm_array.real[:, self._real_idx],
+            imag=xlm_array.imag[:, self._imag_idx],
+        )
+
     def apply_CL_G(self, xlm_array: jnp.ndarray) -> jnp.ndarray:
         """Correlate independent per-bin harmonic coefficients into the physical Gaussian field.
 
@@ -377,7 +405,7 @@ class ForwardModel:
         ----------
         xlm_array : jnp.ndarray
             Full complex harmonic-coefficient array (independent per
-            bin), as returned by `get_xlm`, shape (Nbins, len(gen_ell)).
+            bin), as returned by `unpack_xlm`, shape (Nbins, len(gen_ell)).
 
         Returns
         -------
@@ -405,9 +433,67 @@ class ForwardModel:
         ylm_imag = jnp.where(self.gen_emm == 0, 0.0, ylm_imag)
         return ylm_real + 1j * ylm_imag
 
+    def unapply_CL_G(self, ylm: jnp.ndarray) -> np.ndarray:
+        """Decorrelate the physical Gaussian field into independent per-bin coefficients.
+
+        Inverse of `apply_CL_G`.
+
+        Parameters
+        ----------
+        ylm : jnp.ndarray
+            Correlated complex harmonic coefficients of the underlying
+            Gaussian field, shape (Nbins, len(gen_ell)).
+
+        Returns
+        -------
+        np.ndarray
+            Independent per-bin complex harmonic coefficients, same shape
+            as `ylm`, in the convention `unpack_xlm` produces.
+
+        Notes
+        -----
+        Undoes `apply_CL_G`'s `1/sqrt(2)` variance split (m>0 scaled back
+        up by `sqrt(2)`; at m=0 the real part already carries the full
+        variance and the imaginary part stays zero), then solves
+        `L_G[:, :, ell] @ out = rhs` at each multipole instead of
+        multiplying by it.
+
+        Multipoles below 2 come back as zero. `compute_CL_G` floors
+        `CL_G` there at 1e-20, so `L_G` is ~1e-10 and the solve would
+        amplify roundoff without bound. Those modes carry nothing:
+        `_real_idx`/`_imag_idx` exclude them, so `pack_xlm` drops them
+        either way.
+
+        NumPy rather than JAX — this runs once at initialization, never
+        inside `log_prob`.
+        """
+        emm = np.asarray(self.gen_emm)
+        scale = np.where(emm == 0, 1.0, np.sqrt(2.0))
+        rhs_real = np.asarray(ylm.real) * scale
+        rhs_imag = np.where(emm == 0, 0.0, np.asarray(ylm.imag) * np.sqrt(2.0))
+
+        # (Nbins, Nbins, n_alm) -> (n_alm, Nbins, Nbins), so both parts solve
+        # as a single batched triangular system rather than a Python loop.
+        L_expanded = np.moveaxis(self.L_G[:, :, self.gen_ell], 2, 0)
+        keep = np.asarray(self.gen_ell) > 1
+
+        out_real = np.zeros_like(rhs_real)
+        out_imag = np.zeros_like(rhs_imag)
+        out_real[:, keep] = np.linalg.solve(
+            L_expanded[keep], rhs_real.T[keep, :, None]
+        )[..., 0].T
+        out_imag[:, keep] = np.linalg.solve(
+            L_expanded[keep], rhs_imag.T[keep, :, None]
+        )[..., 0].T
+        return out_real + 1j * out_imag
+
     @staticmethod
-    def gn(x: jnp.ndarray, N: int, lbda: jnp.ndarray) -> jnp.ndarray:
-        """Evaluate the G_N point-transformation for all tomographic bins at once.
+    def gn_inv(x: jnp.ndarray, N: int, lbda: jnp.ndarray) -> jnp.ndarray:
+        """Map the latent Gaussian field to the density field, for all bins at once.
+
+        This is the inverse of `gn`: it goes `y -> dm`, un-Gaussianizing. `G_N`
+        itself is conventionally the Gaussianizing direction (`dm -> y`), which
+        is what `gn` implements.
 
         Parameters
         ----------
@@ -425,7 +511,7 @@ class ForwardModel:
         Returns
         -------
         jnp.ndarray
-            Transformed field, same shape as `x`.
+            Density contrast field, same shape as `x`.
 
         Raises
         ------
@@ -445,21 +531,126 @@ class ForwardModel:
         else:
             raise ValueError(f"Unknown model type: {N}")
 
-    def x2deff(self, xlm: XlmParams, theta: ThetaParams) -> jnp.ndarray:
+    @staticmethod
+    def gn(
+        dm: np.ndarray,
+        N: int,
+        lbda: np.ndarray,
+        n_iter: int = 50,
+        tol: float = 1e-13,
+    ) -> np.ndarray:
+        """Gaussianize the density field, for all tomographic bins at once.
+
+        The `G_N` transform proper — `dm -> y` — and the exact inverse of
+        `gn_inv`.
+
+        Parameters
+        ----------
+        dm : np.ndarray
+            Density contrast field, shape (Nbins, ...) (e.g. one HEALPix
+            map per bin). Every value must lie above the transform's
+            floor; see Raises.
+        N : int
+            Transformation order, ``2`` or ``3``.
+        lbda : np.ndarray
+            Transformation parameters, shape ``(N, Nbins)``: rows ``(alpha,
+            beta)`` for ``N=2``, or ``(a, b, c)`` for ``N=3``, one column
+            per bin.
+        n_iter : int, optional
+            Maximum Newton iterations for ``N=3``, by default 50. Unused
+            for ``N=2``, which is closed-form.
+        tol : float, optional
+            Newton convergence tolerance for ``N=3``, by default 1e-13.
+            Unused for ``N=2``.
+
+        Returns
+        -------
+        np.ndarray
+            Latent Gaussian field, same shape as `dm`.
+
+        Raises
+        ------
+        ValueError
+            If `N` is not `2` or `3`; if any `dm` lies at or below the
+            transform's floor (`-beta` for G2, `-1` for G3), where the
+            transform is undefined; if the `N=3` parameters leave
+            `gn_inv` non-monotonic (needs `a > 0` and `b > 0`), since the
+            Newton solve could then converge to the wrong root; or if
+            that solve fails to converge.
+
+        Notes
+        -----
+        G2 inverts in closed form. G3 has no elementary inverse, so this
+        Newton-solves `exp(a*y - a^2/2) + b*y + c = (1 + dm)(1 + c)`. The
+        left side has derivative `a*exp(a*y - a^2/2) + b`, strictly
+        positive whenever `a, b > 0`, so it increases monotonically and
+        the root is unique.
+
+        NumPy rather than JAX — this runs once at initialization, never
+        inside `log_prob`, and is never differentiated.
+        """
+        dm = np.asarray(dm)
+        lbda = np.asarray(lbda)
+
+        if N == 2:
+            alpha, beta = lbda[..., np.newaxis]
+            arg = dm / beta + 1.0
+            if np.any(arg <= 0.0):
+                raise ValueError(
+                    "gn: dm at or below the G2 floor (-beta); min of "
+                    f"dm/beta + 1 is {float(arg.min()):.3e}, must be > 0."
+                )
+            return (np.log(arg) + 0.5 * alpha**2) / alpha
+
+        elif N == 3:
+            a, b, c = lbda[..., np.newaxis]
+            if np.any(a <= 0.0) or np.any(b <= 0.0):
+                raise ValueError(
+                    f"G3 params a={a.ravel()}, b={b.ravel()} do not guarantee a "
+                    "monotonic dm(y) relation over y, so the Newton solve could "
+                    "converge to the wrong root."
+                )
+            if np.any(dm <= -1.0):
+                raise ValueError(
+                    "gn: dm at or below the G3 floor (-1); min dm is "
+                    f"{float(dm.min()):.6f}."
+                )
+
+            target = (1.0 + dm) * (1.0 + c)
+            y = np.zeros(np.broadcast_shapes(dm.shape, a.shape), dtype=float)
+            for _ in range(n_iter):
+                e = np.exp(a * y - 0.5 * a**2)
+                step = (e + b * y + c - target) / (a * e + b)
+                y = y - step
+                if np.max(np.abs(step)) < tol:
+                    break
+
+            residual = np.max(np.abs(np.exp(a * y - 0.5 * a**2) + b * y + c - target))
+            if not residual < tol:
+                raise ValueError(
+                    f"gn: G3 Newton solve did not converge in {n_iter} iterations "
+                    f"(max residual {float(residual):.3e}, tol {tol:.1e})."
+                )
+            return y
+
+        else:
+            raise ValueError(f"Unknown model type: {N}")
+
+    def xlm_to_deff(self, xlm: XlmParams, theta: ThetaParams) -> jnp.ndarray:
         """Forward-model `xlm` into the effective density field used for the likelihood.
 
-        Follows `x2dm`'s pipeline up through the harmonic-space density
+        Follows `xlm_to_dm`'s pipeline up through the harmonic-space density
         contrast `dm_lm`, then additionally applies a theta-dependent
         smoothing filter before transforming back to a map.
 
         Parameters
         ----------
         xlm : XlmParams
-            Free harmonic coefficients (see `get_xlm`).
+            Free harmonic coefficients (see `unpack_xlm`).
         theta : ThetaParams
             Bias/nuisance parameters; only `c` (smoothing amplitude) and
             `log_R` (smoothing scale) are used here — the rest are used
-            later, in `dm_to_binom_params`.
+            later, in `deff_to_binom_params`.
 
         Returns
         -------
@@ -468,16 +659,16 @@ class ForwardModel:
 
         Notes
         -----
-        After `dm_lm` (see `x2dm`), applies
+        After `dm_lm` (see `xlm_to_dm`), applies
         `filt = (1 + c * b_ell) * pixwin`, where `b_ell` is a Gaussian
         smoothing kernel of scale `R = exp(log_R) * pixel_size`, then
         transforms back to a map.
         """
-        xlm_full = self.get_xlm(xlm)
+        xlm_full = self.unpack_xlm(xlm)
         ylm = self.apply_CL_G(xlm_full)
 
         ys = alm2map(ylm, self.Nside, self.gen_lmax)
-        dm = self.gn(ys, self.gn_order, self.lbda)
+        dm = self.gn_inv(ys, self.gn_order, self.lbda)
         dm_lm = map2alm(dm, self.lmax)
         b_ell = jnp.exp(
             -0.5
@@ -490,13 +681,13 @@ class ForwardModel:
         )
         return alm2map(dm_lm * filt, self.Nside, self.lmax)
 
-    def x2dm(self, xlm: XlmParams) -> jnp.ndarray:
+    def xlm_to_dm(self, xlm: XlmParams) -> jnp.ndarray:
         """Forward-model `xlm` into the raw density contrast map.
 
         Parameters
         ----------
         xlm : XlmParams
-            Free harmonic coefficients (see `get_xlm`).
+            Free harmonic coefficients (see `unpack_xlm`).
 
         Returns
         -------
@@ -505,24 +696,24 @@ class ForwardModel:
 
         Notes
         -----
-        Pipeline: `xlm` -> full harmonic array (`get_xlm`) -> correlated
+        Pipeline: `xlm` -> full harmonic array (`unpack_xlm`) -> correlated
         Gaussian field harmonics (`apply_CL_G`) -> Gaussian field map
-        `ys` (`alm2map`) -> the configured `G_N` point transform (`gn`,
+        `ys` (`alm2map`) -> the configured `G_N` point transform (`gn_inv`,
         `self.gn_order`/`self.lbda`) to the density contrast `dm` -> back
         to harmonic space (`map2alm`), pixel-window-filtered if set ->
         back to a map.
         """
-        xlm_full = self.get_xlm(xlm)
+        xlm_full = self.unpack_xlm(xlm)
         ylm = self.apply_CL_G(xlm_full)
 
         ys = alm2map(ylm, self.Nside, self.gen_lmax)
-        dm = self.gn(ys, self.gn_order, self.lbda)
+        dm = self.gn_inv(ys, self.gn_order, self.lbda)
         dm_lm = map2alm(dm, self.lmax)
         if self.pixwin is not None:
             dm_lm = dm_lm * self.pixwin[self.ell]
         return alm2map(dm_lm, self.Nside, self.lmax)
 
-    def dm_to_binom_params(
+    def deff_to_binom_params(
         self, deff: jnp.ndarray, theta: ThetaParams, *, mask_output: bool = False
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Convert the effective density field into binomial (n, p) count parameters.
@@ -531,7 +722,7 @@ class ForwardModel:
         ----------
         deff : jnp.ndarray
             Effective density contrast over the full sky, shape
-            (Nbins, npix), as returned by `x2deff` — full-sky for either
+            (Nbins, npix), as returned by `xlm_to_deff` — full-sky for either
             `mask_output` setting.
         theta : ThetaParams
             Bias/nuisance parameters; uses `A_t`, `log_T` (detection
@@ -634,7 +825,7 @@ class ForwardModel:
         imaginary free parameters.
 
         The binomial term is evaluated on the observed footprint only
-        (`dm_to_binom_params(..., mask_output=True)`), matching
+        (`deff_to_binom_params(..., mask_output=True)`), matching
         `Ng_obs`'s masked layout.
 
         Two additional terms cover `theta`:
@@ -653,9 +844,9 @@ class ForwardModel:
         """
         theta = params.theta
 
-        deff = self.x2deff(params.xlm, theta)
+        deff = self.xlm_to_deff(params.xlm, theta)
 
-        n, p = self.dm_to_binom_params(deff, theta, mask_output=True)
+        n, p = self.deff_to_binom_params(deff, theta, mask_output=True)
 
         log_lik = jnp.sum(jst.binom.logpmf(self.Ng_obs, n, p))
 
@@ -771,7 +962,7 @@ class ForwardModel:
         Parameters
         ----------
         xlm : XlmParams
-            Free harmonic coefficients (see `get_xlm`) — the latent truth
+            Free harmonic coefficients (see `unpack_xlm`) — the latent truth
             to generate a mock observation from.
         theta : ThetaParams
             Bias/nuisance parameters.
@@ -801,8 +992,8 @@ class ForwardModel:
             can send `n` (and so `kmax`) into the millions, making
             `_inverse_cdf_scan` hang. Caught by `make_random_mock`.
         """
-        deff = self.x2deff(xlm, theta)
-        n, p = self.dm_to_binom_params(deff, theta, mask_output=False)
+        deff = self.xlm_to_deff(xlm, theta)
+        n, p = self.deff_to_binom_params(deff, theta, mask_output=False)
         kmax = int(np.ceil(float(jnp.max(n)))) + 1
         if kmax > 5000:
             raise _KmaxExceeded(kmax)
